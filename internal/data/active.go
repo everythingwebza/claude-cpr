@@ -1,6 +1,7 @@
 package data
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strconv"
@@ -17,7 +18,12 @@ func getActiveProjectDirs() map[string]struct{} {
 	if err != nil {
 		return out
 	}
-	cmd := exec.Command(pgrep, "-a", "-x", "claude")
+	// Hard cap on pgrep runtime so an unresponsive /proc (rare on unusual
+	// container setups) cannot hang the caller. WaitDelay ensures the pipe
+	// is drained promptly after the context fires.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, pgrep, "-a", "-x", "claude")
 	cmd.WaitDelay = 5 * time.Second
 	b, _ := cmd.Output() // exit status 1 (no matches) is fine
 
@@ -26,9 +32,10 @@ func getActiveProjectDirs() map[string]struct{} {
 		if line == "" {
 			continue
 		}
-		// pgrep -a output: "<pid> <cmdline>"
+		// pgrep -a output: "<pid> <cmdline>" — separator is normally a space
+		// on Linux but allow a tab as defensive coverage.
 		var pidStr string
-		if sp := strings.IndexByte(line, ' '); sp > 0 {
+		if sp := strings.IndexAny(line, " \t"); sp > 0 {
 			pidStr = line[:sp]
 		} else {
 			pidStr = line
