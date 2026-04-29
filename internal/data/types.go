@@ -12,8 +12,9 @@ type SessionInfo struct {
 
 // historyAgg is the per-session aggregate built from history.jsonl.
 type historyAgg struct {
-	FirstTS    int64
-	LastTS     int64
-	MsgCount   int
-	LastPrompt string
+	FirstTS      int64
+	LastTS       int64
+	MsgCount     int
+	LastPrompt   string
+	lastUsefulTS int64 // timestamp of the useful prompt currently stored in LastPrompt
 }

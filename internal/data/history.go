@@ -3,10 +3,23 @@ package data
 import (
 	"bufio"
 	"encoding/json"
-	"io"
+	"math"
 	"os"
 	"strings"
 )
+
+// noisePrefixes are the case-insensitive prefixes that mark a prompt as
+// non-substantive (one-word confirmations, slash commands, interruption markers).
+// A prompt matching any of these is excluded from `historyAgg.LastPrompt`.
+var noisePrefixes = []string{
+	"/",
+	"[request interrupted",
+	"exit",
+	"quit",
+	"yes",
+	"no",
+	"ok",
+}
 
 // parseHistory reads history.jsonl and returns map[project][sessionID]*historyAgg.
 // Errors on individual lines are skipped; an unreadable file returns an error.
@@ -48,7 +61,7 @@ func parseHistory(path string) (map[string]map[string]*historyAgg, error) {
 		}
 		agg := proj[d.SessionID]
 		if agg == nil {
-			agg = &historyAgg{FirstTS: 1 << 62}
+			agg = &historyAgg{FirstTS: math.MaxInt64}
 			proj[d.SessionID] = agg
 		}
 		agg.MsgCount++
@@ -58,11 +71,15 @@ func parseHistory(path string) (map[string]map[string]*historyAgg, error) {
 		if d.Timestamp > agg.LastTS {
 			agg.LastTS = d.Timestamp
 		}
-		if isUsefulPrompt(d.Display) {
+		// Track LastPrompt by timestamp, not by file order: pick the useful prompt
+		// with the latest timestamp. This is robust to history.jsonl entries
+		// arriving out of order (rare in practice but possible).
+		if isUsefulPrompt(d.Display) && d.Timestamp >= agg.lastUsefulTS {
 			agg.LastPrompt = strings.TrimSpace(d.Display)
+			agg.lastUsefulTS = d.Timestamp
 		}
 	}
-	if err := sc.Err(); err != nil && err != io.EOF {
+	if err := sc.Err(); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -75,8 +92,7 @@ func isUsefulPrompt(p string) bool {
 		return false
 	}
 	lower := strings.ToLower(p)
-	noise := []string{"/", "[request interrupted", "exit", "quit", "yes", "no", "ok"}
-	for _, n := range noise {
+	for _, n := range noisePrefixes {
 		if strings.HasPrefix(lower, n) {
 			return false
 		}

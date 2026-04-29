@@ -40,3 +40,21 @@ func TestParseHistory_FixtureProducesExpectedAggregates(t *testing.T) {
 		t.Errorf("entries with empty project should be dropped: %+v", sess)
 	}
 }
+
+// TestParseHistory_LastPromptUsesTimestampNotFileOrder guards against a regression
+// where LastPrompt was set "last seen" rather than "latest by timestamp". The
+// fixture has a useful prompt with an earlier timestamp arriving later in the
+// file; the correct LastPrompt is the chronologically-latest useful prompt.
+func TestParseHistory_LastPromptUsesTimestampNotFileOrder(t *testing.T) {
+	aggs, err := parseHistory("testdata/history_out_of_order.jsonl")
+	if err != nil {
+		t.Fatalf("parseHistory error: %v", err)
+	}
+	a := aggs["/home/u/proj"]["sess-x"]
+	if a == nil {
+		t.Fatalf("missing sess-x")
+	}
+	if a.LastPrompt != "latest useful prompt by time" {
+		t.Errorf("LastPrompt should be the chronologically-latest useful prompt; got %q", a.LastPrompt)
+	}
+}
