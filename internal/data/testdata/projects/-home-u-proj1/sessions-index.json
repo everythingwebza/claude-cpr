@@ -1,0 +1,20 @@
+{
+  "originalPath": "/home/u/proj1",
+  "entries": [
+    {
+      "sessionId": "sess-a",
+      "summary": "Refactor the parser",
+      "messageCount": 12,
+      "gitBranch": "main",
+      "modified": "2026-04-28T10:00:00Z",
+      "firstPrompt": "let's start"
+    },
+    {
+      "sessionId": "sess-d",
+      "summary": "Index-only session, never in history",
+      "messageCount": 3,
+      "gitBranch": "feature/x",
+      "modified": "2026-04-27T08:00:00Z"
+    }
+  ]
+}
