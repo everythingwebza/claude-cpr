@@ -18,6 +18,8 @@
 
 **Source spec:** `docs/superpowers/specs/2026-04-29-cpr-go-rewrite-design.md`
 
+**Important note for executing agents:** After Task 1, all six dependencies in `go.mod` are tagged `// indirect` because no Go source file imports them yet. Each module becomes "direct" naturally as later tasks add imports. **Do not run `go mod tidy` until source files actually import the deps you need** — `go mod tidy` will strip unused indirect deps. If a tidy strips them, recover with `go get <pkg>@latest` for each one. `go build` is sufficient verification at every step; `go mod tidy` should only be run once near the end (Task 18 or 19) when all imports are stable.
+
 ---
 
 ## File Structure
