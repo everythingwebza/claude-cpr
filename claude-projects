@@ -1,0 +1,1622 @@
+#!/usr/bin/env python3
+"""
+claude-projects - Browse, search, and resume Claude Code sessions.
+
+Usage:
+  claude-projects              Interactive picker (latest sessions from recent projects)
+  claude-projects list         Interactive project browser with session drill-down
+  claude-projects search       Global search across all session content
+  claude-projects -n 15        Show top 15 sessions instead of default 10
+  claude-projects -p 8         Show sessions from top 8 projects (default 5)
+"""
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import textwrap
+import time
+import tty
+from datetime import datetime, timezone
+from pathlib import Path
+from collections import defaultdict, OrderedDict
+
+CLAUDE_DIR = Path.home() / ".claude"
+CLAUDE_PROJECTS_DIR = CLAUDE_DIR / "projects"
+HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
+WHITE = "\033[97m"
+RED = "\033[31m"
+BLUE = "\033[34m"
+REVERSE = "\033[7m"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+
+
+def graceful_exit(*_):
+    sys.stdout.write(f"{SHOW_CURSOR}{RESET}\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, graceful_exit)
+
+
+# ─── Terminal utilities ────────────────────────────────────────────────
+
+def is_tty():
+    return os.isatty(sys.stdin.fileno())
+
+
+def get_terminal_size():
+    try:
+        cols, rows = os.get_terminal_size()
+        return cols, rows
+    except OSError:
+        return 80, 24
+
+
+def get_terminal_height():
+    return get_terminal_size()[1]
+
+
+def get_terminal_width():
+    return get_terminal_size()[0]
+
+
+def read_key():
+    """Read a single keypress, handling escape sequences."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            ch2 = sys.stdin.read(1)
+            if ch2 == "[":
+                ch3 = sys.stdin.read(1)
+                if ch3 in "ABCD":
+                    return {"A": "up", "B": "down", "C": "right", "D": "left"}[ch3]
+                if ch3 == "5":
+                    sys.stdin.read(1)  # consume ~
+                    return "pgup"
+                if ch3 == "6":
+                    sys.stdin.read(1)  # consume ~
+                    return "pgdn"
+                if ch3 == "H":
+                    return "home"
+                if ch3 == "F":
+                    return "end"
+                return ""
+            return "esc"
+        if ch == "\x03":
+            return "ctrl-c"
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == "\x7f":
+            return "backspace"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+_last_esc_time = 0
+
+def check_esc(threshold=0.5):
+    """Detect single vs double Esc. Returns 'back' or 'quit'."""
+    global _last_esc_time
+    now = time.monotonic()
+    if now - _last_esc_time < threshold:
+        _last_esc_time = 0
+        return "quit"
+    _last_esc_time = now
+    return "back"
+
+
+def prompt_input(text):
+    """Read input with graceful Ctrl+C / EOF handling."""
+    try:
+        print(text, end="", flush=True)
+        return input().strip()
+    except (EOFError, KeyboardInterrupt):
+        graceful_exit()
+
+
+def clear_lines(count):
+    """Move cursor up `count` lines and clear to end of screen."""
+    if count > 0:
+        sys.stdout.write(f"\033[{count}A\033[J")
+
+
+def hint(key, label):
+    """Format a single key hint: bright key, dim label."""
+    return f"{WHITE}{key}{RESET} {DIM}{label}{RESET}"
+
+
+def show_help_overlay(context="picker"):
+    """Show a contextual help overlay. Press any key to dismiss."""
+    lines = []
+    lines.append("")
+    lines.append(f"  {BOLD}{WHITE}Keyboard Shortcuts{RESET}")
+    lines.append(f"  {DIM}{'─' * 40}{RESET}")
+    lines.append("")
+
+    common = [
+        ("↑ / ↓  or  k / j", "Navigate items"),
+        ("Enter", "Select / confirm"),
+        ("Esc", "Go back one level"),
+        ("Esc Esc", "Quit entirely"),
+        ("q", "Quit"),
+        ("Ctrl+C", "Force quit"),
+    ]
+
+    context_keys = {
+        "picker": [
+            ("/", "Search all sessions"),
+            ("p  or  →", "Preview conversation"),
+            ("l", "All projects list"),
+        ],
+        "projects": [
+            ("/", "Search all sessions"),
+        ],
+        "sessions": [
+            ("p  or  →", "Preview conversation"),
+        ],
+        "search": [
+            ("p  or  →", "Preview with highlights"),
+            ("/", "New search"),
+        ],
+        "preview": [
+            ("↑ / ↓  or  k / j", "Scroll line by line"),
+            ("PgUp / PgDn", "Scroll by page"),
+            ("g", "Jump to top"),
+            ("G", "Jump to bottom"),
+            ("←  or  Backspace", "Go back"),
+        ],
+    }
+
+    if context != "preview":
+        lines.append(f"  {DIM}General:{RESET}")
+        for key, label in common:
+            lines.append(f"    {WHITE}{key:<20}{RESET} {label}")
+        lines.append("")
+
+    ctx = context_keys.get(context, [])
+    if ctx:
+        ctx_label = context.replace("_", " ").title()
+        lines.append(f"  {DIM}This screen:{RESET}")
+        for key, label in ctx:
+            lines.append(f"    {WHITE}{key:<20}{RESET} {label}")
+        lines.append("")
+
+    lines.append(f"  {DIM}Press any key to close{RESET}")
+    lines.append("")
+
+    line_count = len(lines)
+    sys.stdout.write(HIDE_CURSOR)
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+    read_key()
+
+    clear_lines(line_count)
+    sys.stdout.flush()
+
+
+# ─── Data helpers ──────────────────────────────────────────────────────
+
+def project_dir_name(project_path):
+    """Convert a project path to its ~/.claude/projects/ directory name."""
+    return project_path.replace("/", "-")
+
+
+_active_dirs = None
+
+def get_active_project_dirs():
+    """Return set of project paths that have a running claude process."""
+    active = set()
+    try:
+        result = subprocess.run(
+            ["pgrep", "-a", "-x", "claude"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            pid = line.split()[0]
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+                active.add(cwd)
+            except OSError:
+                pass
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return active
+
+
+def is_project_active(project_path):
+    global _active_dirs
+    if _active_dirs is None:
+        _active_dirs = get_active_project_dirs()
+    return project_path in _active_dirs
+
+
+def short_project_name(path):
+    parts = Path(path).parts
+    skip = {"home", "michael", "dev", "mnt", "c", "PrivateData", "Work", "www", "Users", "micha"}
+    meaningful = [p for p in parts if p not in skip and p != "/"]
+    if len(meaningful) >= 2:
+        return "/".join(meaningful[-2:])
+    elif meaningful:
+        return meaningful[-1]
+    return path
+
+
+def truncate(text, max_len=72):
+    text = text.lstrip("/ ").strip()
+    return text[:max_len] + "..." if len(text) > max_len + 3 else text
+
+
+def ts_to_iso(ts_ms):
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+
+
+def format_time_ago(iso_str):
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        delta = now - dt
+        days = delta.days
+        hours = delta.seconds // 3600
+        minutes = (delta.seconds % 3600) // 60
+        if days > 30:
+            return f"{days // 30}mo ago"
+        elif days > 0:
+            return f"{days}d ago"
+        elif hours > 0:
+            return f"{hours}h ago"
+        elif minutes > 0:
+            return f"{minutes}m ago"
+        else:
+            return "just now"
+    except (ValueError, TypeError):
+        return "unknown"
+
+
+def format_date(iso_str):
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.strftime("%b %d, %H:%M")
+    except (ValueError, TypeError):
+        return "unknown"
+
+
+# ─── Session data loading (with cache) ─────────────────────────────────
+
+_session_cache = None
+
+
+def get_session_custom_title(project_path, session_id):
+    dir_name = project_dir_name(project_path)
+    session_file = CLAUDE_PROJECTS_DIR / dir_name / f"{session_id}.jsonl"
+    if not session_file.exists():
+        return None
+    try:
+        with open(session_file) as f:
+            for line in f:
+                try:
+                    d = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") == "custom-title":
+                    return d.get("customTitle", "")
+    except OSError:
+        pass
+    return None
+
+
+def get_session_file_mtime(project_path, session_id):
+    dir_name = project_dir_name(project_path)
+    session_file = CLAUDE_PROJECTS_DIR / dir_name / f"{session_id}.jsonl"
+    if session_file.exists():
+        mtime = session_file.stat().st_mtime
+        return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+    return None
+
+
+def load_sessions_from_history():
+    projects = defaultdict(lambda: defaultdict(lambda: {
+        "first_ts": float("inf"), "last_ts": 0, "msg_count": 0, "last_prompt": "",
+    }))
+    if not HISTORY_FILE.exists():
+        return projects
+    with open(HISTORY_FILE) as f:
+        for line in f:
+            try:
+                d = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            sid = d.get("sessionId", "")
+            proj = d.get("project", "")
+            ts = d.get("timestamp", 0)
+            prompt = d.get("display", "").strip()
+            if not sid or not proj:
+                continue
+            sess = projects[proj][sid]
+            sess["msg_count"] += 1
+            if ts < sess["first_ts"]:
+                sess["first_ts"] = ts
+            if ts > sess["last_ts"]:
+                sess["last_ts"] = ts
+            noise = ("/", "[Request interrupted", "exit", "quit", "yes", "no", "ok")
+            is_useful = (prompt and len(prompt) > 5
+                         and not any(prompt.lower().startswith(n) for n in noise))
+            if is_useful:
+                sess["last_prompt"] = prompt
+    return projects
+
+
+def load_sessions_from_index():
+    indexed = {}
+    if not CLAUDE_PROJECTS_DIR.exists():
+        return indexed
+    for index_file in CLAUDE_PROJECTS_DIR.rglob("sessions-index.json"):
+        try:
+            with open(index_file) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        project_path = data.get("originalPath", "")
+        for entry in data.get("entries", []):
+            sid = entry.get("sessionId", "")
+            if sid and project_path:
+                indexed[(project_path, sid)] = entry
+    return indexed
+
+
+def build_session_list(force=False):
+    """Build unified session list. Cached after first call."""
+    global _session_cache
+    if _session_cache is not None and not force:
+        return _session_cache
+
+    history_data = load_sessions_from_history()
+    index_data = load_sessions_from_index()
+    sessions = []
+
+    for proj, sess_map in history_data.items():
+        for sid, info in sess_map.items():
+            if info["last_ts"] == 0:
+                continue
+            file_mtime = get_session_file_mtime(proj, sid)
+            last_modified = file_mtime or ts_to_iso(info["last_ts"])
+            idx_entry = index_data.get((proj, sid), {})
+            custom_title = get_session_custom_title(proj, sid)
+            idx_summary = idx_entry.get("summary", "")
+            title = custom_title or idx_summary or info["last_prompt"] or "(untitled)"
+            msg_count = max(info["msg_count"], idx_entry.get("messageCount", 0))
+            branch = idx_entry.get("gitBranch", "")
+            sessions.append({
+                "project": proj, "sessionId": sid, "title": title,
+                "modified": last_modified, "msgCount": msg_count, "branch": branch,
+            })
+
+    for (proj, sid), entry in index_data.items():
+        if proj in history_data and sid in history_data[proj]:
+            continue
+        modified = entry.get("modified", "")
+        if not modified:
+            continue
+        sessions.append({
+            "project": proj, "sessionId": sid,
+            "title": entry.get("summary") or entry.get("firstPrompt", "(untitled)"),
+            "modified": modified, "msgCount": entry.get("messageCount", 0),
+            "branch": entry.get("gitBranch", ""),
+        })
+
+    sessions.sort(key=lambda s: s["modified"], reverse=True)
+    _session_cache = sessions
+    return sessions
+
+
+# ─── Session content extraction (for preview & search) ─────────────────
+
+def extract_messages(project_path, session_id, max_messages=200):
+    """Extract user/assistant text messages from a session JSONL file.
+    Deduplicates streaming chunks by keeping the last version per message ID.
+    """
+    dir_name = project_dir_name(project_path)
+    session_file = CLAUDE_PROJECTS_DIR / dir_name / f"{session_id}.jsonl"
+    if not session_file.exists():
+        return []
+
+    user_msgs = OrderedDict()
+    asst_msgs = OrderedDict()
+    order = []
+
+    try:
+        with open(session_file) as f:
+            for line in f:
+                try:
+                    d = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+
+                msg = d.get("message", {})
+                if not isinstance(msg, dict):
+                    continue
+
+                if d.get("type") == "user" and msg.get("role") == "user":
+                    uuid = d.get("uuid", "")
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        text = content.strip()
+                    elif isinstance(content, list):
+                        text = " ".join(
+                            c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text"
+                        ).strip()
+                    else:
+                        continue
+                    if text and uuid and uuid not in user_msgs:
+                        user_msgs[uuid] = text
+                        order.append(("user", uuid))
+
+                elif msg.get("role") == "assistant":
+                    mid = msg.get("id", "")
+                    content = msg.get("content", [])
+                    if not isinstance(content, list):
+                        continue
+                    texts = []
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            t = c.get("text", "").strip()
+                            if t:
+                                texts.append(t)
+                    if texts and mid:
+                        combined = "\n".join(texts)
+                        if mid not in asst_msgs:
+                            order.append(("assistant", mid))
+                        asst_msgs[mid] = combined
+
+    except OSError:
+        return []
+
+    messages = []
+    seen = set()
+    for role, mid in order:
+        if mid in seen:
+            continue
+        seen.add(mid)
+        if role == "user" and mid in user_msgs:
+            messages.append({"role": "user", "text": user_msgs[mid]})
+        elif role == "assistant" and mid in asst_msgs:
+            messages.append({"role": "assistant", "text": asst_msgs[mid]})
+        if len(messages) >= max_messages:
+            break
+
+    return messages
+
+
+# ─── Search ────────────────────────────────────────────────────────────
+
+def search_session_files(query, sessions):
+    """Search across all session JSONL files for query.
+    Returns list of (session_dict, match_count) sorted by match_count desc.
+    """
+    if not query or not CLAUDE_PROJECTS_DIR.exists():
+        return []
+
+    by_id = {s["sessionId"]: s for s in sessions}
+    matches = []
+
+    rg = shutil.which("rg")
+    grep = shutil.which("grep")
+
+    if rg:
+        try:
+            result = subprocess.run(
+                [rg, "-c", "-i", "--no-messages",
+                 "-g", "*.jsonl", "-g", "!*index*",
+                 query, str(CLAUDE_PROJECTS_DIR)],
+                capture_output=True, text=True, timeout=30,
+            )
+            for line in result.stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                path_str, _, count_str = line.rpartition(":")
+                try:
+                    count = int(count_str)
+                except ValueError:
+                    continue
+                session_id = Path(path_str).stem
+                if session_id in by_id:
+                    matches.append((by_id[session_id], count))
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    elif grep:
+        try:
+            result = subprocess.run(
+                [grep, "-r", "-c", "-i", "--include=*.jsonl",
+                 query, str(CLAUDE_PROJECTS_DIR)],
+                capture_output=True, text=True, timeout=30,
+            )
+            for line in result.stdout.strip().split("\n"):
+                if not line.strip() or "index" in line:
+                    continue
+                path_str, _, count_str = line.rpartition(":")
+                try:
+                    count = int(count_str)
+                    if count == 0:
+                        continue
+                except ValueError:
+                    continue
+                session_id = Path(path_str).stem
+                if session_id in by_id:
+                    matches.append((by_id[session_id], count))
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    else:
+        # Pure Python fallback
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+        for jsonl in CLAUDE_PROJECTS_DIR.rglob("*.jsonl"):
+            if "index" in jsonl.name:
+                continue
+            session_id = jsonl.stem
+            if session_id not in by_id:
+                continue
+            try:
+                count = 0
+                with open(jsonl) as f:
+                    for line in f:
+                        count += len(pattern.findall(line))
+                if count > 0:
+                    matches.append((by_id[session_id], count))
+            except OSError:
+                continue
+
+    matches.sort(key=lambda x: x[0]["modified"], reverse=True)
+    return matches[:100]
+
+
+# ─── Preview UI ────────────────────────────────────────────────────────
+
+def show_preview(session, highlight=None):
+    """Show scrollable conversation preview. Returns 'back' or 'quit'."""
+    messages = extract_messages(session["project"], session["sessionId"])
+    if not messages:
+        sys.stdout.write(f"  {YELLOW}No messages found in this session.{RESET}\n")
+        sys.stdout.flush()
+        time.sleep(1)
+        return "back"
+
+    term_width = get_terminal_width()
+    content_width = max(40, term_width - 8)
+
+    # Pre-compute all display lines
+    all_lines = []
+    for msg in messages:
+        if msg["role"] == "user":
+            all_lines.append(f"{GREEN}{BOLD} USER:{RESET}")
+        else:
+            all_lines.append(f"{CYAN}{BOLD} CLAUDE:{RESET}")
+
+        for paragraph in msg["text"].split("\n"):
+            if not paragraph.strip():
+                all_lines.append("")
+                continue
+            wrapped = textwrap.wrap(paragraph, width=content_width) or [""]
+            for wl in wrapped:
+                if highlight:
+                    pat = re.compile(re.escape(highlight), re.IGNORECASE)
+                    wl = pat.sub(lambda m: f"{RED}{BOLD}{m.group()}{RESET}", wl)
+                all_lines.append(f"   {wl}")
+
+        all_lines.append("")
+
+    scroll = 0
+    prev_line_count = 0
+    overhead = 5
+
+    sys.stdout.write(HIDE_CURSOR)
+    sys.stdout.flush()
+
+    try:
+        while True:
+            term_height = get_terminal_height()
+            visible = max(5, term_height - overhead)
+            max_scroll = max(0, len(all_lines) - visible)
+            scroll = max(0, min(scroll, max_scroll))
+
+            lines = []
+            title = truncate(session["title"], 60)
+            name = short_project_name(session["project"])
+            lines.append(f"  {BOLD}{CYAN}{name}{RESET}  {WHITE}{title}{RESET}")
+            sep_width = min(70, term_width - 4)
+            lines.append(f"  {DIM}{'─' * sep_width}{RESET}")
+
+            window = all_lines[scroll:scroll + visible]
+            for wl in window:
+                lines.append(f"  {wl}")
+
+            lines.append(f"  {DIM}{'─' * sep_width}{RESET}")
+            total = len(all_lines)
+            pos_str = f"lines {scroll + 1}-{min(scroll + visible, total)}/{total}"
+            lines.append(f"  {hint('↑↓/jk', 'scroll')}  {hint('PgUp/Dn', 'page')}  {hint('g/G', 'top/end')}  {hint('Esc/←', 'back')}  {hint('?', 'help')}  {DIM}{pos_str}{RESET}")
+
+            clear_lines(prev_line_count)
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+            prev_line_count = len(lines)
+
+            key = read_key()
+            if key in ("ctrl-c", "q"):
+                return "quit"
+            if key in ("esc", "left", "backspace"):
+                return check_esc() if key == "esc" else "back"
+            elif key in ("up", "k"):
+                scroll = max(0, scroll - 1)
+            elif key in ("down", "j"):
+                scroll = min(max_scroll, scroll + 1)
+            elif key == "pgup":
+                scroll = max(0, scroll - visible)
+            elif key == "pgdn":
+                scroll = min(max_scroll, scroll + visible)
+            elif key in ("home", "g"):
+                scroll = 0
+            elif key == "G":
+                scroll = max_scroll
+            elif key == "end":
+                scroll = max_scroll
+            elif key == "?":
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                show_help_overlay("preview")
+
+    finally:
+        clear_lines(prev_line_count)
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+
+
+# ─── Search UI ─────────────────────────────────────────────────────────
+
+def render_search_results(results, cursor, scroll_offset, visible_rows, query):
+    lines = []
+    lines.append(f"  {BOLD}{WHITE}Search Results{RESET}  {DIM}for \"{query}\"{RESET}")
+    lines.append(f"  {DIM}{'─' * 70}{RESET}")
+    lines.append("")
+
+    if not results:
+        lines.append(f"  {YELLOW}No matches found.{RESET}")
+        lines.append("")
+        lines.append(f"  {hint('Esc', 'back')}  {hint('/', 'new search')}  {hint('?', 'help')}")
+        return lines
+
+    total = len(results)
+    for i in range(scroll_offset, min(scroll_offset + visible_rows, total)):
+        session, count = results[i]
+        title = truncate(session["title"])
+        name = short_project_name(session["project"])
+        ago = format_time_ago(session["modified"])
+        is_selected = (i == cursor)
+
+        if is_selected:
+            lines.append(f"  {REVERSE}{BOLD}  ▸ {title:<68}{RESET}")
+            lines.append(f"  {REVERSE}      {name}  ·  {ago}  ·  {count} matches{RESET}")
+        else:
+            lines.append(f"      {WHITE}{title}{RESET}")
+            lines.append(f"      {DIM}{name}  ·  {ago}  ·  {count} matches{RESET}")
+        lines.append("")
+
+    lines.append(f"  {DIM}{'─' * 70}{RESET}")
+    if total > visible_rows:
+        lines.append(f"  {DIM}Showing {scroll_offset + 1}-{min(scroll_offset + visible_rows, total)} of {total}{RESET}")
+    lines.append(f"  {hint('↑↓', 'navigate')}  {hint('Enter', 'resume')}  {hint('p/→', 'preview')}  {hint('/', 'new search')}  {hint('Esc', 'back')}  {hint('?', 'help')}")
+    return lines
+
+
+def cmd_search(sessions, initial_query=None):
+    """Global search across all sessions. Returns 'back' or 'quit'."""
+    query = initial_query
+
+    while True:
+        if query is None:
+            sys.stdout.write(SHOW_CURSOR)
+            sys.stdout.flush()
+            query = prompt_input(f"\n  {BOLD}Search all sessions:{RESET} ")
+            if not query:
+                return "back"
+
+        sys.stdout.write(f"\n  {DIM}Searching...{RESET}")
+        sys.stdout.flush()
+        results = search_session_files(query, sessions)
+        # Clear "Searching..." line
+        sys.stdout.write("\033[1A\033[J")
+
+        if not is_tty():
+            if not results:
+                print(f"\n  {YELLOW}No matches for \"{query}\".{RESET}")
+            else:
+                print(f"\n  {BOLD}{WHITE}Results for \"{query}\":{RESET}\n")
+                for i, (session, count) in enumerate(results[:20], 1):
+                    title = truncate(session["title"])
+                    name = short_project_name(session["project"])
+                    print(f"  {i:>3}  {title}  {DIM}{name} · {count} matches{RESET}")
+            return "back"
+
+        if not results:
+            print(f"  {YELLOW}No matches for \"{query}\".{RESET}")
+            time.sleep(1)
+            sys.stdout.write("\033[1A\033[J")
+            query = None
+            continue
+
+        # TUI navigation of results
+        total = len(results)
+        cursor = 0
+        scroll_offset = 0
+        overhead = 8
+        prev_line_count = 0
+
+        sys.stdout.write(HIDE_CURSOR)
+        sys.stdout.flush()
+
+        try:
+            while True:
+                term_height = get_terminal_height()
+                visible_rows = max(3, (term_height - overhead) // 3)
+                cursor = max(0, min(cursor, total - 1))
+
+                if cursor < scroll_offset:
+                    scroll_offset = cursor
+                elif cursor >= scroll_offset + visible_rows:
+                    scroll_offset = cursor - visible_rows + 1
+
+                lines = render_search_results(results, cursor, scroll_offset, visible_rows, query)
+
+                clear_lines(prev_line_count)
+                sys.stdout.write("\n".join(lines) + "\n")
+                sys.stdout.flush()
+                prev_line_count = len(lines)
+
+                key = read_key()
+
+                if key in ("ctrl-c", "q"):
+                    return "quit"
+                if key == "esc":
+                    return check_esc()
+
+                elif key in ("up", "k"):
+                    if cursor > 0:
+                        cursor -= 1
+                elif key in ("down", "j"):
+                    if cursor < total - 1:
+                        cursor += 1
+
+                elif key in ("p", "right"):
+                    clear_lines(prev_line_count)
+                    prev_line_count = 0
+                    sys.stdout.write(SHOW_CURSOR)
+                    sys.stdout.flush()
+                    session = results[cursor][0]
+                    action = show_preview(session, highlight=query)
+                    if action == "quit":
+                        return "quit"
+                    sys.stdout.write(HIDE_CURSOR)
+                    sys.stdout.flush()
+
+                elif key == "?":
+                    clear_lines(prev_line_count)
+                    prev_line_count = 0
+                    show_help_overlay("search")
+
+                elif key == "/":
+                    clear_lines(prev_line_count)
+                    prev_line_count = 0
+                    query = None
+                    break  # back to outer loop for new query
+
+                elif key == "enter":
+                    clear_lines(prev_line_count)
+                    prev_line_count = 0
+                    sys.stdout.write(SHOW_CURSOR)
+                    sys.stdout.flush()
+                    session = results[cursor][0]
+                    if resume_session(session):
+                        sys.stdout.write(HIDE_CURSOR)
+                        sys.stdout.flush()
+                        continue
+                    return "quit"  # unreachable after exec
+
+        finally:
+            clear_lines(prev_line_count)
+            sys.stdout.write(SHOW_CURSOR)
+            sys.stdout.flush()
+
+
+# ─── Resume / New session ──────────────────────────────────────────────
+
+def resume_session(session):
+    """cd into project and exec claude --resume. Returns True if aborted."""
+    project_path = session["project"]
+    session_id = session["sessionId"]
+    name = short_project_name(project_path)
+
+    if is_project_active(project_path):
+        print()
+        print(f"  {RED}{BOLD}Warning:{RESET} {CYAN}{name}{RESET} has an active Claude session running.")
+        print(f"  {DIM}Resuming may cause conflicts with the running session.{RESET}")
+        choice = prompt_input(f"  {BOLD}Continue anyway? ({DIM}y{RESET}{BOLD}/{DIM}N{RESET}{BOLD}):{RESET} ")
+        if choice.lower() != "y":
+            return True
+
+    print()
+    print(f"  {GREEN}Resuming session in {CYAN}{name}{RESET}")
+    print(f"  {DIM}cd {project_path} && claude --resume {session_id}{RESET}")
+    print()
+    os.chdir(project_path)
+    os.execlp("claude", "claude", "--resume", session_id)
+
+
+def new_session(project_path):
+    """cd into project and exec claude. Returns True if aborted."""
+    name = short_project_name(project_path)
+
+    if is_project_active(project_path):
+        print()
+        print(f"  {RED}{BOLD}Warning:{RESET} {CYAN}{name}{RESET} has an active Claude session running.")
+        choice = prompt_input(f"  {BOLD}Start a new session anyway? ({DIM}y{RESET}{BOLD}/{DIM}N{RESET}{BOLD}):{RESET} ")
+        if choice.lower() != "y":
+            return True
+
+    print()
+    print(f"  {GREEN}New session in {CYAN}{name}{RESET}")
+    print(f"  {DIM}cd {project_path} && claude{RESET}")
+    print()
+    os.chdir(project_path)
+    os.execlp("claude", "claude")
+
+
+# ─── Session row (for fallback mode) ──────────────────────────────────
+
+def print_session_row(num, session, active=False):
+    title = truncate(session["title"])
+    ago = format_time_ago(session["modified"])
+    date = format_date(session["modified"])
+    msgs = session["msgCount"]
+    branch = session["branch"]
+    active_str = f" {RED}{BOLD}ACTIVE{RESET}" if active else ""
+    branch_str = f" {MAGENTA}{branch}{RESET}" if branch else ""
+    msg_str = f"{msgs} msgs" if msgs else ""
+    print(f"    {BOLD}{GREEN}{num:>2}{RESET}  {WHITE}{title}{RESET}{active_str}")
+    print(f"        {DIM}{date} ({ago}){' · ' + msg_str if msg_str else ''}{branch_str}{RESET}")
+
+
+# ─── Project list ──────────────────────────────────────────────────────
+
+def render_project_list(sorted_projects, proj_sessions, proj_latest, cursor, scroll_offset, visible_rows):
+    lines = []
+    lines.append(f"  {BOLD}{WHITE}All Claude Code Projects{RESET}")
+    lines.append(f"  {DIM}{'─' * 70}{RESET}")
+    lines.append("")
+    lines.append(f"  {DIM}{'':>3}  {'Project':<40} {'Sessions':>8}  {'Last Active':>12}{RESET}")
+    lines.append(f"  {DIM}{'─' * 70}{RESET}")
+
+    total_count = len(sorted_projects)
+    for i in range(scroll_offset, min(scroll_offset + visible_rows, total_count)):
+        proj = sorted_projects[i]
+        name = short_project_name(proj)
+        count = len(proj_sessions[proj])
+        ago = format_time_ago(proj_latest[proj])
+        active = is_project_active(proj)
+        active_marker = f"{RED}*{RESET}" if active else " "
+        num = i + 1
+        if i == cursor:
+            lines.append(f"  {REVERSE}{BOLD} {num:>3} {active_marker} {name:<40}  {count:>8}  {ago:>12} {RESET}")
+        else:
+            lines.append(f"  {DIM}{num:>3}{RESET} {active_marker} {CYAN}{name:<40}{RESET} {WHITE}{count:>8}{RESET}  {DIM}{ago:>12}{RESET}")
+
+    total = sum(len(v) for v in proj_sessions.values())
+    lines.append("")
+    if total_count > visible_rows:
+        pos = scroll_offset + 1
+        end = min(scroll_offset + visible_rows, total_count)
+        lines.append(f"  {DIM}Showing {pos}-{end} of {total_count} projects ({total} sessions){RESET}")
+    else:
+        lines.append(f"  {DIM}{total_count} projects, {total} total sessions{RESET}")
+    lines.append("")
+    lines.append(f"  {hint('↑↓', 'navigate')}  {hint('Enter', 'select')}  {hint('/', 'search')}  {hint('Esc', 'back')}  {hint('q', 'quit')}  {hint('?', 'help')}")
+    return lines
+
+
+def _build_project_data():
+    sessions = build_session_list()
+    if not sessions:
+        print(f"{YELLOW}No Claude projects found.{RESET}")
+        return None
+    proj_sessions = OrderedDict()
+    proj_latest = {}
+    for s in sessions:
+        p = s["project"]
+        if p not in proj_sessions:
+            proj_sessions[p] = []
+            proj_latest[p] = s["modified"]
+        proj_sessions[p].append(s)
+    sorted_projects = sorted(proj_sessions.keys(), key=lambda p: proj_latest[p], reverse=True)
+    return sorted_projects, proj_sessions, proj_latest
+
+
+def cmd_list():
+    data = _build_project_data()
+    if not data:
+        return "quit"
+    if is_tty():
+        return _cmd_list_tui(*data)
+    else:
+        return _cmd_list_fallback(*data)
+
+
+def _cmd_list_fallback(sorted_projects, proj_sessions, proj_latest):
+    while True:
+        print(f"\n  {BOLD}{WHITE}All Claude Code Projects{RESET}")
+        print(f"  {DIM}{'─' * 70}{RESET}")
+        print()
+        print(f"  {DIM}{'':>3}  {'Project':<40} {'Sessions':>8}  {'Last Active':>12}{RESET}")
+        print(f"  {DIM}{'─' * 70}{RESET}")
+        for i, proj in enumerate(sorted_projects, 1):
+            name = short_project_name(proj)
+            count = len(proj_sessions[proj])
+            ago = format_time_ago(proj_latest[proj])
+            active = is_project_active(proj)
+            active_str = f" {RED}{BOLD}*{RESET}" if active else "  "
+            print(f"  {DIM}{i:>3}{RESET}{active_str}{CYAN}{name:<40}{RESET} {WHITE}{count:>8}{RESET}  {DIM}{ago:>12}{RESET}")
+        total = sum(len(v) for v in proj_sessions.values())
+        print()
+        print(f"  {DIM}{len(sorted_projects)} projects, {total} total sessions{RESET}")
+        print()
+        choice = prompt_input(f"  {BOLD}Enter project number, {DIM}b{RESET}{BOLD}ack, or {DIM}q{RESET}{BOLD}uit:{RESET} ")
+        if choice.lower() == "q":
+            return "quit"
+        if choice.lower() in ("b", ""):
+            return "back"
+        try:
+            idx = int(choice) - 1
+            if not (0 <= idx < len(sorted_projects)):
+                print(f"  {YELLOW}Invalid selection.{RESET}")
+                continue
+        except ValueError:
+            print(f"  {YELLOW}Invalid input.{RESET}")
+            continue
+        proj = sorted_projects[idx]
+        action = show_project_sessions(proj, proj_sessions[proj])
+        if action == "quit":
+            return "quit"
+
+
+def _cmd_list_tui(sorted_projects, proj_sessions, proj_latest):
+    total_count = len(sorted_projects)
+    cursor = 0
+    scroll_offset = 0
+    overhead = 8
+    prev_line_count = 0
+
+    sys.stdout.write(HIDE_CURSOR)
+    sys.stdout.flush()
+
+    try:
+        while True:
+            term_height = get_terminal_height()
+            visible_rows = max(5, term_height - overhead)
+            cursor = max(0, min(cursor, total_count - 1))
+            if cursor < scroll_offset:
+                scroll_offset = cursor
+            elif cursor >= scroll_offset + visible_rows:
+                scroll_offset = cursor - visible_rows + 1
+
+            lines = render_project_list(
+                sorted_projects, proj_sessions, proj_latest,
+                cursor, scroll_offset, visible_rows,
+            )
+
+            clear_lines(prev_line_count)
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+            prev_line_count = len(lines)
+
+            key = read_key()
+
+            if key in ("ctrl-c", "q"):
+                return "quit"
+            if key == "esc":
+                return check_esc()
+            elif key in ("up", "k"):
+                if cursor > 0:
+                    cursor -= 1
+            elif key in ("down", "j"):
+                if cursor < total_count - 1:
+                    cursor += 1
+
+            elif key == "?":
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                show_help_overlay("projects")
+
+            elif key == "/":
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+                sessions = build_session_list()
+                action = cmd_search(sessions)
+                if action == "quit":
+                    return "quit"
+                sys.stdout.write(HIDE_CURSOR)
+                sys.stdout.flush()
+
+            elif key == "enter":
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+                proj = sorted_projects[cursor]
+                action = show_project_sessions(proj, proj_sessions[proj])
+                if action == "quit":
+                    return "quit"
+                sys.stdout.write(HIDE_CURSOR)
+                sys.stdout.flush()
+
+    finally:
+        clear_lines(prev_line_count)
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+
+
+# ─── Session view (per-project) — fully scrollable ────────────────────
+
+def show_project_sessions(project_path, sessions):
+    """Show sessions for a project. Returns 'back' or 'quit'."""
+    if is_tty():
+        return _show_sessions_tui(project_path, sessions)
+    else:
+        return _show_sessions_fallback(project_path, sessions)
+
+
+def render_session_list(project_path, sessions, cursor, scroll_offset, visible_rows):
+    """Render scrollable session list for a project."""
+    name = short_project_name(project_path)
+    proj_active = is_project_active(project_path)
+    lines = []
+
+    active_label = f"  {RED}{BOLD}ACTIVE{RESET}" if proj_active else ""
+    lines.append(f"  {BOLD}{CYAN}{name}{RESET}  {DIM}{project_path}{RESET}{active_label}")
+    lines.append(f"  {DIM}{'─' * 70}{RESET}")
+    lines.append("")
+
+    total_items = len(sessions) + 1  # sessions + "New session"
+
+    for i in range(scroll_offset, min(scroll_offset + visible_rows, total_items)):
+        if i < len(sessions):
+            s = sessions[i]
+            title = truncate(s["title"])
+            ago = format_time_ago(s["modified"])
+            date = format_date(s["modified"])
+            msgs = s["msgCount"]
+            branch = s["branch"]
+            active_str = f" {RED}{BOLD}ACTIVE{RESET}" if (proj_active and i == 0) else ""
+            branch_str = f" {MAGENTA}{branch}{RESET}" if branch else ""
+            msg_str = f"{msgs} msgs" if msgs else ""
+            is_selected = (cursor == i)
+
+            if is_selected:
+                lines.append(f"  {REVERSE}{BOLD}  ▸ {title:<68}{RESET}{active_str}")
+                lines.append(f"  {REVERSE}      {date} ({ago}){' · ' + msg_str if msg_str else ''}{' ' + branch if branch else '':>20}{RESET}")
+            else:
+                lines.append(f"      {WHITE}{title}{RESET}{active_str}")
+                lines.append(f"      {DIM}{date} ({ago}){' · ' + msg_str if msg_str else ''}{branch_str}{RESET}")
+            lines.append("")
+        else:
+            # "New session" option
+            if cursor == i:
+                lines.append(f"  {REVERSE}{BOLD}  ▸ {'New session':<68}{RESET}")
+            else:
+                lines.append(f"      {GREEN}{BOLD}New session{RESET}")
+            lines.append("")
+
+    lines.append(f"  {DIM}{'─' * 70}{RESET}")
+    if total_items > visible_rows:
+        pos = scroll_offset + 1
+        end = min(scroll_offset + visible_rows, total_items)
+        lines.append(f"  {DIM}Showing {pos}-{end} of {total_items} items{RESET}")
+    lines.append(f"  {hint('↑↓', 'navigate')}  {hint('Enter', 'select')}  {hint('p/→', 'preview')}  {hint('Esc', 'back')}  {hint('q', 'quit')}  {hint('?', 'help')}")
+    return lines
+
+
+def _show_sessions_tui(project_path, sessions):
+    """Arrow-key navigable session list — fully scrollable. Returns 'back' or 'quit'."""
+    total_items = len(sessions) + 1
+    cursor = 0
+    scroll_offset = 0
+    overhead = 7
+    prev_line_count = 0
+
+    sys.stdout.write(HIDE_CURSOR)
+    sys.stdout.flush()
+
+    try:
+        while True:
+            term_height = get_terminal_height()
+            visible_rows = max(3, (term_height - overhead) // 3)
+            cursor = max(0, min(cursor, total_items - 1))
+
+            if cursor < scroll_offset:
+                scroll_offset = cursor
+            elif cursor >= scroll_offset + visible_rows:
+                scroll_offset = cursor - visible_rows + 1
+
+            lines = render_session_list(project_path, sessions, cursor, scroll_offset, visible_rows)
+
+            clear_lines(prev_line_count)
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+            prev_line_count = len(lines)
+
+            key = read_key()
+
+            if key in ("ctrl-c", "q"):
+                return "quit"
+            if key == "esc":
+                return check_esc()
+            elif key in ("up", "k"):
+                if cursor > 0:
+                    cursor -= 1
+            elif key in ("down", "j"):
+                if cursor < total_items - 1:
+                    cursor += 1
+
+            elif key == "?":
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                show_help_overlay("sessions")
+
+            elif key in ("p", "right"):
+                if cursor < len(sessions):
+                    clear_lines(prev_line_count)
+                    prev_line_count = 0
+                    sys.stdout.write(SHOW_CURSOR)
+                    sys.stdout.flush()
+                    action = show_preview(sessions[cursor])
+                    if action == "quit":
+                        return "quit"
+                    sys.stdout.write(HIDE_CURSOR)
+                    sys.stdout.flush()
+
+            elif key == "enter":
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+
+                if cursor < len(sessions):
+                    if resume_session(sessions[cursor]):
+                        sys.stdout.write(HIDE_CURSOR)
+                        sys.stdout.flush()
+                        continue
+                    return "quit"  # unreachable after exec
+                else:
+                    if new_session(project_path):
+                        sys.stdout.write(HIDE_CURSOR)
+                        sys.stdout.flush()
+                        continue
+                    return "quit"  # unreachable after exec
+
+    finally:
+        clear_lines(prev_line_count)
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+
+
+def _show_sessions_fallback(project_path, sessions):
+    """Fallback session list using number input. Returns 'back' or 'quit'."""
+    name = short_project_name(project_path)
+    proj_active = is_project_active(project_path)
+
+    while True:
+        print()
+        active_label = f"  {RED}{BOLD}ACTIVE{RESET}" if proj_active else ""
+        print(f"  {BOLD}{CYAN}{name}{RESET}  {DIM}{project_path}{RESET}{active_label}")
+        print(f"  {DIM}{'─' * 70}{RESET}")
+        print()
+        for i, s in enumerate(sessions, 1):
+            print_session_row(i, s, active=(proj_active and i == 1))
+            print()
+        print(f"  {DIM}{'─' * 70}{RESET}")
+        print(f"    {BOLD}{GREEN} n{RESET}  {WHITE}New session{RESET}")
+        print()
+        choice = prompt_input(
+            f"  {BOLD}Enter session number, {DIM}n{RESET}{BOLD}ew session, "
+            f"{DIM}b{RESET}{BOLD}ack, or {DIM}q{RESET}{BOLD}uit:{RESET} "
+        )
+        if choice.lower() == "q":
+            return "quit"
+        if choice.lower() in ("b", ""):
+            return "back"
+        if choice.lower() == "n":
+            if new_session(project_path):
+                continue
+            return "quit"
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(sessions):
+                if resume_session(sessions[idx]):
+                    continue
+                return "quit"
+            else:
+                print(f"  {YELLOW}Invalid selection.{RESET}")
+        except ValueError:
+            print(f"  {YELLOW}Invalid input.{RESET}")
+
+
+# ─── Quick picker ──────────────────────────────────────────────────────
+
+def _build_pick_rows(max_sessions=10, top_projects=5, per_project=2):
+    sessions = build_session_list()
+    if not sessions:
+        return None, None
+
+    proj_sessions = OrderedDict()
+    for s in sessions:
+        p = s["project"]
+        if p not in proj_sessions:
+            proj_sessions[p] = []
+        proj_sessions[p].append(s)
+
+    top_projs = list(proj_sessions.keys())[:top_projects]
+    rows = []
+    selectable = []
+    session_count = 0
+
+    for proj in top_projs:
+        if session_count >= max_sessions:
+            break
+        proj_active = is_project_active(proj)
+        name = short_project_name(proj)
+        rows.append({"type": "header", "name": name, "path": proj, "active": proj_active})
+
+        first_in_proj = True
+        for s in proj_sessions[proj][:per_project]:
+            if session_count >= max_sessions:
+                break
+            active_label = proj_active and first_in_proj
+            first_in_proj = False
+            idx = len(rows)
+            rows.append({"type": "session", "session": s, "active_label": active_label})
+            selectable.append(idx)
+            session_count += 1
+
+    return rows, selectable
+
+
+def render_pick_rows(rows, selectable, cursor, scroll_offset, visible_rows):
+    lines = []
+    lines.append(f"  {BOLD}{WHITE}Recent Claude Sessions{RESET}")
+    lines.append(f"  {DIM}{'─' * 70}{RESET}")
+    lines.append("")
+
+    if not selectable:
+        lines.append(f"  {YELLOW}No sessions found.{RESET}")
+        return lines
+
+    vis_start = scroll_offset
+    vis_end = min(scroll_offset + visible_rows, len(selectable))
+
+    first_row = selectable[vis_start]
+    last_row = selectable[vis_end - 1]
+
+    header_start = first_row
+    for r in range(first_row - 1, -1, -1):
+        if rows[r]["type"] == "header":
+            header_start = r
+            break
+
+    for ri in range(header_start, last_row + 1):
+        row = rows[ri]
+        if row["type"] == "header":
+            active_label = f"  {RED}{BOLD}ACTIVE{RESET}" if row["active"] else ""
+            lines.append(f"  {BOLD}{CYAN}{row['name']}{RESET}  {DIM}{row['path']}{RESET}{active_label}")
+        elif row["type"] == "session":
+            s = row["session"]
+            title = truncate(s["title"])
+            ago = format_time_ago(s["modified"])
+            date = format_date(s["modified"])
+            msgs = s["msgCount"]
+            branch = s["branch"]
+            active_str = f" {RED}{BOLD}ACTIVE{RESET}" if row["active_label"] else ""
+            branch_str = f" {MAGENTA}{branch}{RESET}" if branch else ""
+            msg_str = f"{msgs} msgs" if msgs else ""
+            is_selected = ri == selectable[cursor]
+
+            if is_selected:
+                lines.append(f"  {REVERSE}{BOLD}  ▸ {title:<68}{RESET}{active_str}")
+                lines.append(f"  {REVERSE}      {date} ({ago}){' · ' + msg_str if msg_str else ''}{' ' + branch if branch else '':>20}{RESET}")
+            else:
+                lines.append(f"      {WHITE}{title}{RESET}{active_str}")
+                lines.append(f"      {DIM}{date} ({ago}){' · ' + msg_str if msg_str else ''}{branch_str}{RESET}")
+            lines.append("")
+
+    lines.append(f"  {DIM}{'─' * 70}{RESET}")
+    total = len(selectable)
+    if total > visible_rows:
+        lines.append(f"  {DIM}Showing {vis_start + 1}-{vis_end} of {total} sessions{RESET}")
+    lines.append(f"  {hint('↑↓', 'navigate')}  {hint('Enter', 'resume')}  {hint('p/→', 'preview')}  {hint('/', 'search')}  {hint('l', 'all projects')}  {hint('?', 'help')}")
+    return lines
+
+
+def cmd_pick(max_sessions=10, top_projects=5, per_project=2):
+    rows, selectable = _build_pick_rows(max_sessions, top_projects, per_project)
+    if not rows:
+        print(f"{YELLOW}No Claude sessions found.{RESET}")
+        return
+
+    if not is_tty():
+        _cmd_pick_fallback(rows, selectable)
+        return
+
+    total = len(selectable)
+    cursor = 0
+    scroll_offset = 0
+    overhead = 6
+    prev_line_count = 0
+
+    sys.stdout.write(HIDE_CURSOR)
+    sys.stdout.flush()
+
+    try:
+        while True:
+            term_height = get_terminal_height()
+            visible_rows = max(3, (term_height - overhead) // 3)
+            cursor = max(0, min(cursor, total - 1))
+
+            if cursor < scroll_offset:
+                scroll_offset = cursor
+            elif cursor >= scroll_offset + visible_rows:
+                scroll_offset = cursor - visible_rows + 1
+
+            lines = render_pick_rows(rows, selectable, cursor, scroll_offset, visible_rows)
+
+            clear_lines(prev_line_count)
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+            prev_line_count = len(lines)
+
+            key = read_key()
+
+            if key in ("ctrl-c", "q", "esc"):
+                return
+
+            elif key == "?":
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                show_help_overlay("picker")
+
+            elif key == "l":
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+                result = cmd_list()
+                if result == "quit":
+                    return
+                sys.stdout.write(HIDE_CURSOR)
+                sys.stdout.flush()
+
+            elif key == "/":
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+                sessions = build_session_list()
+                action = cmd_search(sessions)
+                if action == "quit":
+                    return
+                sys.stdout.write(HIDE_CURSOR)
+                sys.stdout.flush()
+
+            elif key in ("p", "right"):
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+                row = rows[selectable[cursor]]
+                action = show_preview(row["session"])
+                if action == "quit":
+                    return
+                sys.stdout.write(HIDE_CURSOR)
+                sys.stdout.flush()
+
+            elif key in ("up", "k"):
+                if cursor > 0:
+                    cursor -= 1
+
+            elif key in ("down", "j"):
+                if cursor < total - 1:
+                    cursor += 1
+
+            elif key == "enter":
+                clear_lines(prev_line_count)
+                prev_line_count = 0
+                sys.stdout.write(SHOW_CURSOR)
+                sys.stdout.flush()
+                row = rows[selectable[cursor]]
+                if resume_session(row["session"]):
+                    sys.stdout.write(HIDE_CURSOR)
+                    sys.stdout.flush()
+                    continue
+                return  # unreachable after exec
+
+    finally:
+        clear_lines(prev_line_count)
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+
+
+def _cmd_pick_fallback(rows, selectable):
+    """Non-TTY fallback: numbered list with text input."""
+    print()
+    print(f"  {BOLD}{WHITE}Recent Claude Sessions{RESET}")
+    print(f"  {DIM}{'─' * 70}{RESET}")
+    print()
+
+    for ri, row in enumerate(rows):
+        if row["type"] == "header":
+            active_label = f"  {RED}{BOLD}ACTIVE{RESET}" if row["active"] else ""
+            print(f"  {BOLD}{CYAN}{row['name']}{RESET}  {DIM}{row['path']}{RESET}{active_label}")
+        elif row["type"] == "session":
+            num = selectable.index(ri) + 1
+            print_session_row(num, row["session"], active=row["active_label"])
+            print()
+
+    print(f"  {DIM}{'─' * 70}{RESET}")
+
+    choice = prompt_input(
+        f"  {BOLD}Enter number to resume, {DIM}l{RESET}{BOLD}ist all, or {DIM}q{RESET}{BOLD}uit:{RESET} "
+    )
+
+    if choice.lower() in ("q", ""):
+        return
+    if choice.lower() == "l":
+        cmd_list()
+        return
+
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(selectable):
+            resume_session(rows[selectable[idx]]["session"])
+        else:
+            print(f"  {YELLOW}Invalid selection.{RESET}")
+    except ValueError:
+        print(f"  {YELLOW}Invalid input.{RESET}")
+
+
+# ─── Help ──────────────────────────────────────────────────────────────
+
+def cmd_help():
+    print(f"""
+  {BOLD}{WHITE}claude-projects (cpr){RESET} — Browse, search, and resume Claude Code sessions
+  {DIM}{'─' * 66}{RESET}
+
+  {BOLD}{WHITE}COMMANDS{RESET}
+
+    {GREEN}cpr{RESET}              Quick picker — latest sessions from your most
+                       active projects. Arrow keys to navigate, Enter
+                       to resume.
+
+    {GREEN}cpr list{RESET}         Full interactive project browser with arrow key
+                       navigation and session drill-down.
+
+    {GREEN}cpr search{RESET}       Global search across all session content
+                       (user prompts and Claude responses).
+
+    {GREEN}cpr help{RESET}         This guide.
+
+  {BOLD}{WHITE}OPTIONS{RESET}
+
+    {GREEN}-n {DIM}<count>{RESET}       Max sessions in quick picker (default 10)
+    {GREEN}-p {DIM}<count>{RESET}       Max projects in quick picker (default 5)
+
+  {BOLD}{WHITE}NAVIGATION{RESET}
+
+    {DIM}All TUI screens:{RESET}
+      {WHITE}↑ / ↓{RESET}  {DIM}or{RESET}  {WHITE}k / j{RESET}    Navigate items
+      {WHITE}Enter{RESET}              Select / drill in
+      {WHITE}Esc{RESET}                Go back one level
+      {WHITE}Esc Esc{RESET}            Quit entirely (rapid double-press)
+      {WHITE}q{RESET}                  Quit entirely
+      {WHITE}Ctrl+C{RESET}             Quit from anywhere
+
+    {DIM}Quick picker (cpr):{RESET}
+      {WHITE}/{RESET}                  Search all sessions
+      {WHITE}p{RESET} {DIM}or{RESET} {WHITE}→{RESET}             Preview conversation
+      {WHITE}l{RESET}                  Switch to full project list
+      {WHITE}Esc{RESET}                Quit (top level)
+
+    {DIM}Project list (cpr list / l):{RESET}
+      {WHITE}/{RESET}                  Search all sessions
+      {WHITE}Enter{RESET}              Drill into selected project
+      {WHITE}Esc{RESET}                Back to quick picker (or quit)
+
+    {DIM}Project sessions:{RESET}
+      {WHITE}p{RESET} {DIM}or{RESET} {WHITE}→{RESET}             Preview conversation
+      {WHITE}Enter{RESET}              Resume session / start new
+      {WHITE}Esc{RESET}                Back to project list
+
+    {DIM}Preview:{RESET}
+      {WHITE}↑ / ↓{RESET}  {DIM}or{RESET}  {WHITE}k / j{RESET}    Scroll line by line
+      {WHITE}PgUp / PgDn{RESET}        Scroll by page
+      {WHITE}g / G{RESET}              Jump to top / bottom
+      {WHITE}Esc{RESET} {DIM}or{RESET} {WHITE}←{RESET}            Back
+
+    {DIM}Search results:{RESET}
+      {WHITE}p{RESET} {DIM}or{RESET} {WHITE}→{RESET}             Preview with highlights
+      {WHITE}/{RESET}                  New search
+      {WHITE}Enter{RESET}              Resume session
+      {WHITE}Esc{RESET}                Back
+
+  {BOLD}{WHITE}ACTIVE SESSION DETECTION{RESET}
+
+    Projects with a running Claude process show {RED}{BOLD}*{RESET} / {RED}{BOLD}ACTIVE{RESET}.
+    You'll get a warning before resuming into an active project.
+
+  {BOLD}{WHITE}EXAMPLES{RESET}
+
+    {DIM}${RESET} cpr                 {DIM}# quick pick from recent sessions{RESET}
+    {DIM}${RESET} cpr list             {DIM}# browse all projects{RESET}
+    {DIM}${RESET} cpr search           {DIM}# search all conversations{RESET}
+    {DIM}${RESET} cpr -n 20 -p 10      {DIM}# show more in quick picker{RESET}
+""")
+
+
+# ─── Main ──────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+
+    if "help" in args or "-h" in args or "--help" in args:
+        cmd_help()
+    elif "search" in args:
+        sessions = build_session_list()
+        if sessions:
+            cmd_search(sessions)
+        else:
+            print(f"{YELLOW}No Claude sessions found.{RESET}")
+    elif "list" in args:
+        cmd_list()
+    else:
+        max_sessions = 10
+        top_projects = 5
+        per_project = 2
+        if "-n" in args:
+            try:
+                max_sessions = int(args[args.index("-n") + 1])
+            except (IndexError, ValueError):
+                pass
+        if "-p" in args:
+            try:
+                top_projects = int(args[args.index("-p") + 1])
+            except (IndexError, ValueError):
+                pass
+        cmd_pick(max_sessions=max_sessions, top_projects=top_projects, per_project=per_project)
+
+
+if __name__ == "__main__":
+    main()
