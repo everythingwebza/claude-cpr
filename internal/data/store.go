@@ -17,15 +17,14 @@ type SessionStore struct {
 	historyPath  string
 	projectsRoot string
 
-	mu             sync.Mutex
-	sessions       []SessionInfo
-	historyAggs    map[string]map[string]*historyAgg
-	indexEntries   map[indexKey]indexEntry
-	historyMtime   time.Time
-	projectsMtimes map[string]time.Time // sessions-index.json paths → mtime
-	customTitle    map[string]string    // sessionFile path → title cache
-	customMtimes   map[string]time.Time
-	activeDirs     map[string]struct{}
+	mu           sync.Mutex
+	sessions     []SessionInfo
+	historyAggs  map[string]map[string]*historyAgg
+	indexEntries map[indexKey]indexEntry
+	historyMtime time.Time
+	customTitle  map[string]string // sessionFile path → title cache
+	customMtimes map[string]time.Time
+	activeDirs   map[string]struct{}
 
 	transcripts *lru.Cache[string, []Message] // key: sessionFilePath
 }
@@ -36,16 +35,21 @@ func NewSessionStore(historyPath, projectsRoot string) (*SessionStore, error) {
 		return nil, err
 	}
 	return &SessionStore{
-		historyPath:    historyPath,
-		projectsRoot:   projectsRoot,
-		projectsMtimes: map[string]time.Time{},
-		customTitle:    map[string]string{},
-		customMtimes:   map[string]time.Time{},
-		transcripts:    cache,
+		historyPath:  historyPath,
+		projectsRoot: projectsRoot,
+		customTitle:  map[string]string{},
+		customMtimes: map[string]time.Time{},
+		transcripts:  cache,
 	}, nil
 }
 
 // Build returns the merged session list, refreshing caches if any source mtime changed.
+//
+// The lock is held across filesystem I/O (parseHistory / parseAllIndices /
+// getActiveProjectDirs) for simplicity. This is acceptable for a single-UI-
+// goroutine model — Build is called from the Bubble Tea event loop, never in
+// hot paths. If a future task adds a background refresh ticker, swap in a
+// snapshot/swap pattern so other readers don't block on the rebuild.
 func (s *SessionStore) Build() ([]SessionInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -77,14 +81,25 @@ func (s *SessionStore) Build() ([]SessionInfo, error) {
 	return s.sessions, nil
 }
 
-// ActiveDirs returns the cached active-project set from the most recent Build.
+// ActiveDirs returns a copy of the cached active-project set from the most
+// recent Build. The copy isolates callers from concurrent rebuilds and
+// prevents accidental external mutation of internal state.
 func (s *SessionStore) ActiveDirs() map[string]struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.activeDirs
+	out := make(map[string]struct{}, len(s.activeDirs))
+	for k := range s.activeDirs {
+		out[k] = struct{}{}
+	}
+	return out
 }
 
 // Transcript loads (and caches) the messages for a session.
+//
+// Note: the cached value is whatever the FIRST caller's `max` produced — a
+// later call with a larger `max` returns the same truncated slice. In
+// practice all callers pass the same value (the PreviewModel's preview cap),
+// so this is fine. If a caller needs a different cap, evict via the LRU first.
 func (s *SessionStore) Transcript(project, sessionID string, max int) ([]Message, error) {
 	file := s.sessionFile(project, sessionID)
 	if v, ok := s.transcripts.Get(file); ok {

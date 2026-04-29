@@ -15,7 +15,11 @@ func main() {
 	flag.BoolVar(&dump, "dump-sessions", false, "print merged session list as JSON, then exit")
 	flag.Parse()
 
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "home dir:", err)
+		os.Exit(1)
+	}
 	historyPath := filepath.Join(home, ".claude", "history.jsonl")
 	projectsRoot := filepath.Join(home, ".claude", "projects")
 
