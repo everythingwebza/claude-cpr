@@ -27,6 +27,8 @@ func extractMessages(sessionFile string, maxMessages int) ([]Message, error) {
 		id   string
 		text string
 	}
+	// User UUIDs and assistant message IDs occupy distinct namespaces in the
+	// JSONL, so a single map keyed by either is collision-safe in practice.
 	var order []string
 	seen := map[string]*slot{}
 
@@ -60,6 +62,8 @@ func extractMessages(sessionFile string, maxMessages int) ([]Message, error) {
 			if text == "" {
 				continue
 			}
+			// User messages are not streamed; a duplicate UUID indicates a
+			// re-appended entry — first occurrence is canonical.
 			if _, ok := seen[d.UUID]; !ok {
 				seen[d.UUID] = &slot{role: "user", id: d.UUID, text: text}
 				order = append(order, d.UUID)
@@ -112,6 +116,9 @@ func contentToText(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &arr); err != nil {
 		return ""
 	}
+	// Claude text-content blocks are whole tokens; fragments already contain
+	// any inter-word whitespace. A space separator would double-space runs
+	// that end with trailing whitespace, so none is added here.
 	var b strings.Builder
 	for _, c := range arr {
 		if c.Type != "text" {
