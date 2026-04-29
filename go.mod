@@ -1,4 +1,4 @@
-module github.com/defusiondev/claude-cpr
+module github.com/everythingwebza/claude-cpr
 
 go 1.24.2
 

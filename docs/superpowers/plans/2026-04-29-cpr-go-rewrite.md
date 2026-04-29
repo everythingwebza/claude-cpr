@@ -82,10 +82,10 @@ bin/
 
 ```bash
 cd /home/michael/dev/ai/wsl/cpr
-go mod init github.com/defusiondev/claude-cpr
+go mod init github.com/everythingwebza/claude-cpr
 ```
 
-Expected: `go.mod` is created with `module github.com/defusiondev/claude-cpr` and `go 1.22` (or higher).
+Expected: `go.mod` is created with `module github.com/everythingwebza/claude-cpr` and `go 1.22` (or higher).
 
 - [ ] **Step 4: Add core dependencies**
 
@@ -201,7 +201,7 @@ cd /home/michael/dev/ai/wsl/cpr
 gh repo create claude-cpr --private --source=. --remote=origin --push
 ```
 
-Expected: repo created at `https://github.com/defusiondev/claude-cpr`, initial commit pushed.
+Expected: repo created at `https://github.com/everythingwebza/claude-cpr`, initial commit pushed.
 
 ---
 
@@ -1241,7 +1241,7 @@ import (
     "os"
     "path/filepath"
 
-    "github.com/defusiondev/claude-cpr/internal/data"
+    "github.com/everythingwebza/claude-cpr/internal/data"
 )
 
 func main() {
@@ -1447,7 +1447,7 @@ package ui
 import (
     "testing"
 
-    "github.com/defusiondev/claude-cpr/internal/data"
+    "github.com/everythingwebza/claude-cpr/internal/data"
 )
 
 func TestTreeModel_FlattenWithExpansion(t *testing.T) {
@@ -1520,7 +1520,7 @@ import (
 
     "github.com/charmbracelet/bubbles/key"
     tea "github.com/charmbracelet/bubbletea"
-    "github.com/defusiondev/claude-cpr/internal/data"
+    "github.com/everythingwebza/claude-cpr/internal/data"
     "github.com/sahilm/fuzzy"
 )
 
@@ -1926,7 +1926,7 @@ package ui
 import (
     "github.com/charmbracelet/bubbles/viewport"
     tea "github.com/charmbracelet/bubbletea"
-    "github.com/defusiondev/claude-cpr/internal/data"
+    "github.com/everythingwebza/claude-cpr/internal/data"
 )
 
 // PreviewModel is filled out in Task 11 (debounced auto-load + LRU).
@@ -1972,7 +1972,7 @@ import (
     "github.com/charmbracelet/bubbles/key"
     tea "github.com/charmbracelet/bubbletea"
     "github.com/charmbracelet/lipgloss"
-    "github.com/defusiondev/claude-cpr/internal/data"
+    "github.com/everythingwebza/claude-cpr/internal/data"
 )
 
 type Focus int
@@ -2219,8 +2219,8 @@ import (
     "path/filepath"
 
     tea "github.com/charmbracelet/bubbletea"
-    "github.com/defusiondev/claude-cpr/internal/data"
-    "github.com/defusiondev/claude-cpr/internal/ui"
+    "github.com/everythingwebza/claude-cpr/internal/data"
+    "github.com/everythingwebza/claude-cpr/internal/ui"
 )
 
 func main() {
@@ -2299,7 +2299,7 @@ import (
 
     "github.com/charmbracelet/bubbles/viewport"
     tea "github.com/charmbracelet/bubbletea"
-    "github.com/defusiondev/claude-cpr/internal/data"
+    "github.com/everythingwebza/claude-cpr/internal/data"
 )
 
 type PreviewModel struct {
@@ -2734,8 +2734,8 @@ import (
     "github.com/charmbracelet/bubbles/textinput"
     tea "github.com/charmbracelet/bubbletea"
     "github.com/charmbracelet/lipgloss"
-    "github.com/defusiondev/claude-cpr/internal/data"
-    "github.com/defusiondev/claude-cpr/internal/search"
+    "github.com/everythingwebza/claude-cpr/internal/data"
+    "github.com/everythingwebza/claude-cpr/internal/search"
 )
 
 type OverlayKind int
@@ -3209,7 +3209,7 @@ Expected: PASS.
 - [ ] **Step 5: Wire state into `Model`**
 
 In `model.go`:
-1. Import `"github.com/defusiondev/claude-cpr/internal/state"`.
+1. Import `"github.com/everythingwebza/claude-cpr/internal/state"`.
 2. Add fields to `Model`: `state state.State`, `statePath string`.
 3. In `NewModel`, compute `statePath = filepath.Join(home, ".claude", ".cpr-state.json")`, call `state.Load`. Apply `state.Expanded` to the tree (overriding the top-2 default if non-empty). Apply `state.Pinned` to `tree.pinned`. Apply `state.SortMode`. Restore cursor by walking the rendered rows for a match.
 4. Add a helper `(m *Model) saveState()` that writes the current `state` to `statePath`, and call it on `tea.Quit` (in the Esc/Quit branch) and after pin/sort/cursor changes.
@@ -3516,7 +3516,7 @@ import (
 
     tea "github.com/charmbracelet/bubbletea"
     "github.com/charmbracelet/x/exp/teatest"
-    "github.com/defusiondev/claude-cpr/internal/data"
+    "github.com/everythingwebza/claude-cpr/internal/data"
 )
 
 // fakeStore implements just enough of the SessionStore surface used by Model
@@ -3621,7 +3621,7 @@ A Bubble Tea TUI to browse, search, and resume Claude Code sessions across all y
 
 Prerequisites: Go 1.22+, ripgrep (`apt install ripgrep`) recommended for fast content search.
 
-    git clone https://github.com/defusiondev/claude-cpr.git
+    git clone https://github.com/everythingwebza/claude-cpr.git
     cd claude-cpr
     make install
 
@@ -3739,7 +3739,7 @@ git tag v0.1.0
 git push --tags
 ```
 
-Expected: pushed; tag visible at `https://github.com/defusiondev/claude-cpr/releases/tag/v0.1.0`.
+Expected: pushed; tag visible at `https://github.com/everythingwebza/claude-cpr/releases/tag/v0.1.0`.
 
 The Python file at `/home/michael/scripts/claude-projects` is left in place as a fallback. After ~1 week of using the Go binary, run `rm /home/michael/scripts/claude-projects` to retire it.
 
