@@ -1,0 +1,7 @@
+{"sessionId":"sess-a","project":"/home/u/proj1","timestamp":1700000000000,"display":"first prompt"}
+{"sessionId":"sess-a","project":"/home/u/proj1","timestamp":1700000100000,"display":"second prompt"}
+{"sessionId":"sess-a","project":"/home/u/proj1","timestamp":1700000200000,"display":"yes"}
+{"sessionId":"sess-b","project":"/home/u/proj2","timestamp":1700000300000,"display":"another session"}
+{"sessionId":"","project":"/home/u/proj2","timestamp":1700000400000,"display":"missing sid — should skip"}
+{"sessionId":"sess-c","project":"","timestamp":1700000500000,"display":"missing project — should skip"}
+{"sessionId":"sess-a","project":"/home/u/proj1","timestamp":1700000600000,"display":"/exit"}
