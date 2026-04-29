@@ -1,0 +1,6 @@
+{"type":"user","uuid":"u1","message":{"role":"user","content":"hello there"}}
+{"type":"assistant","message":{"role":"assistant","id":"a1","content":[{"type":"text","text":"hi! "}]}}
+{"type":"assistant","message":{"role":"assistant","id":"a1","content":[{"type":"text","text":"hi! how can I help"}]}}
+{"type":"user","uuid":"u2","message":{"role":"user","content":[{"type":"text","text":"please "},{"type":"text","text":"refactor X"}]}}
+{"type":"assistant","message":{"role":"assistant","id":"a2","content":[{"type":"text","text":"sure"}]}}
+{"type":"custom-title","customTitle":"Refactor the parser"}
