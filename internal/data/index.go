@@ -20,9 +20,9 @@ type indexEntry struct {
 	FirstPrompt  string
 }
 
-// loadAllIndices walks rootDir for any sessions-index.json files and merges them.
+// parseAllIndices walks rootDir for any sessions-index.json files and merges them.
 // Missing rootDir returns an empty map without error.
-func loadAllIndices(rootDir string) (map[indexKey]indexEntry, error) {
+func parseAllIndices(rootDir string) (map[indexKey]indexEntry, error) {
 	out := map[indexKey]indexEntry{}
 	if _, err := os.Stat(rootDir); os.IsNotExist(err) {
 		return out, nil

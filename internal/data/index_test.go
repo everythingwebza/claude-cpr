@@ -5,9 +5,9 @@ import (
 )
 
 func TestLoadIndex_FixtureProducesEntries(t *testing.T) {
-	indexed, err := loadAllIndices("testdata/projects")
+	indexed, err := parseAllIndices("testdata/projects")
 	if err != nil {
-		t.Fatalf("loadAllIndices error: %v", err)
+		t.Fatalf("parseAllIndices error: %v", err)
 	}
 	e, ok := indexed[indexKey{Project: "/home/u/proj1", SessionID: "sess-a"}]
 	if !ok {
