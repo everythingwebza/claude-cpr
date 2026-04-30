@@ -31,6 +31,43 @@ func TestModelUpdate_ArrowDownMovesTreeCursor(t *testing.T) {
 	}
 }
 
+func TestModelView_FitsExactlyInTerminalHeight(t *testing.T) {
+	// Drive a WindowSizeMsg through Update, then assert View() output is no
+	// taller than the reported terminal height. Lipgloss's alt-screen will
+	// scroll any overflow off the top, hiding the search bar.
+	sessions := []data.SessionInfo{}
+	for i := 0; i < 50; i++ {
+		sessions = append(sessions, data.SessionInfo{
+			Project:   "/p" + string(rune('a'+i%26)) + string(rune('a'+i/26)),
+			SessionID: "s",
+			Title:     "session " + string(rune('a'+i%26)),
+			Modified:  "2026-04-29T10:00:00Z",
+		})
+	}
+	tree := NewTreeModel(sessions, map[string]bool{"/paa": true, "/pba": true}, nil, SortRecent)
+	m := Model{
+		tree:    tree,
+		search:  NewSearchModel(),
+		preview: NewPreviewModel(),
+		keys:    DefaultKeyMap(),
+		focus:   FocusTree,
+	}
+	const W, H = 100, 30
+	next, _ := m.Update(tea.WindowSizeMsg{Width: W, Height: H})
+	nm := next.(Model)
+
+	out := nm.View()
+	lines := 1
+	for _, c := range out {
+		if c == '\n' {
+			lines++
+		}
+	}
+	if lines > H {
+		t.Errorf("View at %dx%d emitted %d lines, want ≤ %d", W, H, lines, H)
+	}
+}
+
 func TestModelUpdate_LowercaseKDoesNotJumpToSearch(t *testing.T) {
 	// Vim-style nav 'k' (Up) should reach the tree, not the search bar.
 	sessions := []data.SessionInfo{
