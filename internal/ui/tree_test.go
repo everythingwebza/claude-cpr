@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/everythingwebza/claude-cpr/internal/data"
@@ -57,6 +58,45 @@ func TestTreeModel_ViewClipsToHeight(t *testing.T) {
 	if lines > 10 {
 		t.Errorf("View emitted %d lines, want ≤ 10 (would overflow pane)", lines)
 	}
+}
+
+func TestTreeModel_ViewTruncatesLongRowsToWidth(t *testing.T) {
+	// A long session title must not produce a rendered line wider than m.width,
+	// otherwise the terminal wraps it onto a second line and the pane overflows.
+	long := "this is an unusually long session title that will definitely exceed the available pane width and would wrap if not truncated"
+	sessions := []data.SessionInfo{
+		{Project: "/p1", SessionID: "s1", Title: long, Modified: "2026-04-29T10:00:00Z"},
+	}
+	tm := NewTreeModel(sessions, map[string]bool{"/p1": true}, nil, SortRecent)
+	tm.SetSize(40, 10)
+
+	out := tm.View()
+	for i, line := range strings.Split(out, "\n") {
+		if w := visualWidth(line); w > 40 {
+			t.Errorf("line %d has visual width %d, want ≤ 40: %q", i, w, line)
+		}
+	}
+}
+
+func visualWidth(s string) int {
+	// Strip ANSI escape sequences and count runes. Good enough for the
+	// regression test (no double-width chars in fixture).
+	out := 0
+	in := false
+	for _, r := range s {
+		if r == 0x1b {
+			in = true
+			continue
+		}
+		if in {
+			if r == 'm' {
+				in = false
+			}
+			continue
+		}
+		out++
+	}
+	return out
 }
 
 func TestTreeModel_FlattenWithFilter(t *testing.T) {

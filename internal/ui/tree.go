@@ -8,6 +8,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/everythingwebza/claude-cpr/internal/data"
 	"github.com/sahilm/fuzzy"
 )
@@ -266,6 +267,12 @@ func (m TreeModel) View() string {
 		line := m.renderRow(rows[i])
 		if i == m.cursor {
 			line = StyleSelected.Render(line)
+		}
+		// Truncate to the pane's content width so a too-long row never wraps
+		// onto a second terminal line (which would overflow the pane and
+		// scroll the search bar off the top of the alt-screen).
+		if m.width > 0 {
+			line = ansi.Truncate(line, m.width, "")
 		}
 		b.WriteString(line)
 		if i < end-1 {

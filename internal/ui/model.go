@@ -162,8 +162,13 @@ func (m *Model) layout() {
 	// Chrome rows: search bar (1 input + 1 bottom border = 2) +
 	// pane top/bottom borders (2) + footer (1) = 5.
 	bodyH := m.height - 5 // search bar + footer
-	m.tree.SetSize(leftW-2, bodyH)
-	m.preview.SetSize(rightW-2, bodyH)
+	// SetSize gets the CONTENT width: pane width minus 2 borders AND minus
+	// 2 padding cells (StylePane has Padding(0, 1)). Without subtracting
+	// the padding, a row of exactly leftW-2 visible cells will overflow
+	// and the terminal will wrap it onto a second line, pushing rows below
+	// it past the pane bottom.
+	m.tree.SetSize(leftW-4, bodyH)
+	m.preview.SetSize(rightW-4, bodyH)
 }
 
 func (m Model) handleEnter() (tea.Model, tea.Cmd) {
