@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/everythingwebza/claude-cpr/internal/data"
+	"github.com/everythingwebza/claude-cpr/internal/ui"
 )
 
 func main() {
@@ -28,25 +30,25 @@ func main() {
 		fmt.Fprintln(os.Stderr, "store init:", err)
 		os.Exit(1)
 	}
-	sessions, err := store.Build()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "build:", err)
-		os.Exit(1)
-	}
 
 	if dump {
+		sessions, err := store.Build()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "build:", err)
+			os.Exit(1)
+		}
 		json.NewEncoder(os.Stdout).Encode(sessions)
 		return
 	}
 
-	fmt.Printf("cpr — placeholder. %d sessions loaded across %d projects.\n",
-		len(sessions), countProjects(sessions))
-}
-
-func countProjects(s []data.SessionInfo) int {
-	set := map[string]struct{}{}
-	for _, ss := range s {
-		set[ss.Project] = struct{}{}
+	m, err := ui.NewModel(store)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "model:", err)
+		os.Exit(1)
 	}
-	return len(set)
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "tui:", err)
+		os.Exit(1)
+	}
 }
