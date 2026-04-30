@@ -29,6 +29,36 @@ func TestTreeModel_FlattenWithExpansion(t *testing.T) {
 	}
 }
 
+func TestTreeModel_ViewClipsToHeight(t *testing.T) {
+	// 30 projects, all collapsed → 30 rows from flatten. With height=10, View
+	// must emit at most 10 lines or the pane overflows its allotted height.
+	sessions := []data.SessionInfo{}
+	for i := 0; i < 30; i++ {
+		sessions = append(sessions, data.SessionInfo{
+			Project:   "/p" + string(rune('a'+i%26)) + string(rune('a'+i/26)),
+			SessionID: "s",
+			Title:     "t",
+			Modified:  "2026-04-29T10:00:00Z",
+		})
+	}
+	tm := NewTreeModel(sessions, nil, nil, SortRecent)
+	tm.SetSize(40, 10)
+
+	out := tm.View()
+	if out == "" {
+		t.Fatalf("View returned empty string")
+	}
+	lines := 1
+	for _, c := range out {
+		if c == '\n' {
+			lines++
+		}
+	}
+	if lines > 10 {
+		t.Errorf("View emitted %d lines, want ≤ 10 (would overflow pane)", lines)
+	}
+}
+
 func TestTreeModel_FlattenWithFilter(t *testing.T) {
 	sessions := []data.SessionInfo{
 		{Project: "/p1", SessionID: "s1a", Title: "Alpha refactor", Modified: "2026-04-29T10:00:00Z"},

@@ -43,6 +43,7 @@ type TreeModel struct {
 	cursor     int
 	filter     string
 
+	scrollOffset  int // first visible row index — adjusted to keep cursor in view
 	width, height int
 }
 
@@ -152,7 +153,11 @@ func latestModified(s []data.SessionInfo) string {
 }
 
 // SetFilter recomputes nothing yet; the View call uses the current filter.
-func (m *TreeModel) SetFilter(filter string) { m.filter = filter; m.cursor = 0 }
+func (m *TreeModel) SetFilter(filter string) {
+	m.filter = filter
+	m.cursor = 0
+	m.scrollOffset = 0
+}
 
 // Update handles tree-pane keys. Returns the (possibly mutated) model and any cmd.
 func (m TreeModel) Update(msg tea.Msg, keys KeyMap) (TreeModel, tea.Cmd) {
@@ -187,8 +192,33 @@ func (m TreeModel) Update(msg tea.Msg, keys KeyMap) (TreeModel, tea.Cmd) {
 				m.expanded[rows[m.cursor].Project] = false
 			}
 		}
+		m.adjustScroll()
 	}
 	return m, nil
+}
+
+// adjustScroll keeps the cursor visible inside the [scrollOffset, scrollOffset+height)
+// window. Called after any cursor or expansion change.
+func (m *TreeModel) adjustScroll() {
+	if m.height <= 0 {
+		return
+	}
+	rows := m.flatten(m.filter)
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor >= len(rows) && len(rows) > 0 {
+		m.cursor = len(rows) - 1
+	}
+	if m.cursor < m.scrollOffset {
+		m.scrollOffset = m.cursor
+	}
+	if m.cursor >= m.scrollOffset+m.height {
+		m.scrollOffset = m.cursor - m.height + 1
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
 }
 
 // SelectedRow returns the currently-cursored row, or zero-value Row if none.
@@ -200,27 +230,46 @@ func (m TreeModel) SelectedRow() Row {
 	return rows[m.cursor]
 }
 
-// View renders the tree (clipped to width/height set by parent).
+// View renders the tree, clipped to the visible window starting at scrollOffset
+// and at most m.height rows tall. Lipgloss's Style.Height is a minimum (it
+// pads but doesn't truncate), so the clip MUST happen here or the pane will
+// overflow its bounds and push other UI off-screen.
 //
 // TODO(perf): View, SelectedRow, and Update each call flatten independently.
 // Task 10's wiring may want to memoize the result and invalidate on
-// filter/sort/sessions/expansion change. For 427 sessions current cost is
-// ~1ms per call which is fine for keystroke-rate redraws.
+// filter/sort/sessions/expansion change.
 func (m TreeModel) View() string {
 	rows := m.flatten(m.filter)
+	if len(rows) == 0 {
+		return ""
+	}
+
+	visible := m.height
+	if visible <= 0 {
+		visible = len(rows) // fallback before SetSize is called (e.g., tests)
+	}
+
+	start := m.scrollOffset
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(rows) {
+		start = len(rows) - 1
+	}
+	end := start + visible
+	if end > len(rows) {
+		end = len(rows)
+	}
+
 	var b strings.Builder
-	for i, r := range rows {
-		line := m.renderRow(r)
+	for i := start; i < end; i++ {
+		line := m.renderRow(rows[i])
 		if i == m.cursor {
 			line = StyleSelected.Render(line)
 		}
 		b.WriteString(line)
-		b.WriteString("\n")
-		// Safety clamp — only meaningful once SetSize has been called by the
-		// parent. Without the size-known guard, a render before SetSize would
-		// stop after the first line because m.height*m.width*4 == 0.
-		if m.width > 0 && m.height > 0 && b.Len() > m.height*m.width*4 {
-			break
+		if i < end-1 {
+			b.WriteString("\n")
 		}
 	}
 	return b.String()
@@ -267,7 +316,11 @@ func (m TreeModel) renderRow(r Row) string {
 }
 
 // SetSize is called by the parent on WindowSizeMsg.
-func (m *TreeModel) SetSize(w, h int) { m.width = w; m.height = h }
+func (m *TreeModel) SetSize(w, h int) {
+	m.width = w
+	m.height = h
+	m.adjustScroll()
+}
 
 // shortProjectName returns the last 1-2 meaningful path segments.
 //
