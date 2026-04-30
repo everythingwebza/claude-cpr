@@ -86,8 +86,10 @@ func (m TreeModel) flatten(filter string) []Row {
 				grouped[proj] = kept
 			}
 		}
-		// rebuild order to drop empty projects
-		newOrder := order[:0]
+		// rebuild order to drop empty projects (fresh allocation, not in-place
+		// reuse — `order[:0]` would silently overwrite live entries during
+		// concurrent reads in test code).
+		newOrder := make([]string, 0, len(order))
 		for _, p := range order {
 			if _, ok := grouped[p]; ok {
 				newOrder = append(newOrder, p)
@@ -199,6 +201,11 @@ func (m TreeModel) SelectedRow() Row {
 }
 
 // View renders the tree (clipped to width/height set by parent).
+//
+// TODO(perf): View, SelectedRow, and Update each call flatten independently.
+// Task 10's wiring may want to memoize the result and invalidate on
+// filter/sort/sessions/expansion change. For 427 sessions current cost is
+// ~1ms per call which is fine for keystroke-rate redraws.
 func (m TreeModel) View() string {
 	rows := m.flatten(m.filter)
 	var b strings.Builder
@@ -209,7 +216,10 @@ func (m TreeModel) View() string {
 		}
 		b.WriteString(line)
 		b.WriteString("\n")
-		if b.Len() > m.height*m.width*4 { // safety clamp
+		// Safety clamp — only meaningful once SetSize has been called by the
+		// parent. Without the size-known guard, a render before SetSize would
+		// stop after the first line because m.height*m.width*4 == 0.
+		if m.width > 0 && m.height > 0 && b.Len() > m.height*m.width*4 {
 			break
 		}
 	}
@@ -233,6 +243,8 @@ func (m TreeModel) renderRow(r Row) string {
 		return fmt.Sprintf("%s %s %s", glyph, marker, StyleProject.Render(shortProjectName(r.Project)))
 	case RowSession:
 		title := r.Session.Title
+		// TODO: derive truncation width from m.width (minus indent + meta).
+		// 50 is a reasonable default for 80-column terminals.
 		if len(title) > 50 {
 			title = title[:47] + "..."
 		}
@@ -258,6 +270,10 @@ func (m TreeModel) renderRow(r Row) string {
 func (m *TreeModel) SetSize(w, h int) { m.width = w; m.height = h }
 
 // shortProjectName returns the last 1-2 meaningful path segments.
+//
+// The skip list is intentionally specific to this installation's filesystem
+// layout (home/michael/dev/..., /mnt/c/Users/micha/...). Generalise when
+// packaging for distribution; for now it matches the original Python tool.
 func shortProjectName(p string) string {
 	parts := strings.Split(p, "/")
 	skip := map[string]bool{"home": true, "michael": true, "dev": true, "mnt": true, "c": true,
@@ -285,6 +301,10 @@ func timeAgo(iso string) string {
 	}
 	d := time.Since(t)
 	switch {
+	case d < 0:
+		// Future timestamp (clock skew or test fixture). Don't render
+		// "-5m ago"; treat as recent.
+		return "just now"
 	case d < time.Minute:
 		return "just now"
 	case d < time.Hour:
