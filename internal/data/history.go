@@ -51,7 +51,7 @@ func parseHistory(path string) (map[string]map[string]*historyAgg, error) {
 		if err := json.Unmarshal([]byte(line), &d); err != nil {
 			continue
 		}
-		if d.SessionID == "" || d.Project == "" {
+		if d.Project == "" || !IsValidSessionID(d.SessionID) {
 			continue
 		}
 		proj := out[d.Project]

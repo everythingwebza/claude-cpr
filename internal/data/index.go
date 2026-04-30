@@ -56,7 +56,7 @@ func parseAllIndices(rootDir string) (map[indexKey]indexEntry, error) {
 			return nil
 		}
 		for _, e := range doc.Entries {
-			if e.SessionID == "" {
+			if !IsValidSessionID(e.SessionID) {
 				continue
 			}
 			out[indexKey{Project: doc.OriginalPath, SessionID: e.SessionID}] = indexEntry{

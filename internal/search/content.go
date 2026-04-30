@@ -43,10 +43,12 @@ func Search(ctx context.Context, rootDir, query string) ([]Result, error) {
 func searchRg(ctx context.Context, rg, rootDir, query string) ([]Result, error) {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	// -F: fixed-string match (not regex). --: end of options, so a query
+	// like "--pre=/bin/sh" is treated as a literal pattern, not a flag.
 	cmd := exec.CommandContext(cctx, rg,
-		"-c", "-i", "--no-messages",
+		"-c", "-i", "-F", "--no-messages",
 		"-g", "*.jsonl", "-g", "!*index*",
-		query, rootDir,
+		"--", query, rootDir,
 	)
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
@@ -58,9 +60,10 @@ func searchRg(ctx context.Context, rg, rootDir, query string) ([]Result, error) 
 func searchGrep(ctx context.Context, grep, rootDir, query string) ([]Result, error) {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	// -F + --: same hardening as the rg path above.
 	cmd := exec.CommandContext(cctx, grep,
-		"-r", "-c", "-i", "--include=*.jsonl",
-		query, rootDir,
+		"-r", "-c", "-i", "-F", "--include=*.jsonl",
+		"--", query, rootDir,
 	)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -107,26 +110,36 @@ func SearchPureGo(rootDir, query string) ([]Result, error) {
 		if filepath.Ext(path) != ".jsonl" || strings.Contains(d.Name(), "index") {
 			return nil
 		}
-		f, err := os.Open(path)
-		if err != nil {
-			return nil
-		}
-		defer f.Close()
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 1<<20), 1<<24)
-		n := 0
-		for sc.Scan() {
-			line := bytes.ToLower(sc.Bytes())
-			n += bytes.Count(line, needle)
-		}
-		if n > 0 {
+		// Inline closure so each file's defer fires before the next iteration —
+		// otherwise WalkDir would accumulate one open FD per matched file and
+		// blow past the per-process limit on large transcript collections.
+		count := countMatches(path, needle)
+		if count > 0 {
 			out = append(out, Result{
 				Project:   filepath.Base(filepath.Dir(path)),
 				SessionID: strings.TrimSuffix(d.Name(), ".jsonl"),
-				Count:     n,
+				Count:     count,
 			})
 		}
 		return nil
 	})
 	return out, err
+}
+
+// countMatches opens path, counts occurrences of needle (already lowercased)
+// across all lines, and closes the file before returning.
+func countMatches(path string, needle []byte) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	n := 0
+	for sc.Scan() {
+		line := bytes.ToLower(sc.Bytes())
+		n += bytes.Count(line, needle)
+	}
+	return n
 }

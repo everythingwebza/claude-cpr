@@ -34,9 +34,20 @@ type RenameOp struct {
 }
 
 // OverlayResult is what the overlay returns to the root model — actions the
-// root needs to take (resume, rename) once the overlay's interaction settles.
+// root needs to take (resume, rename, new session) once the overlay's
+// interaction settles.
 type OverlayResult struct {
 	ResumeRequest *data.SessionInfo
+	// ResumeConfirmed is set when the resume request comes from the user
+	// pressing 'y' in the ACTIVE-warning overlay. The root model uses it to
+	// skip re-prompting (which would otherwise loop forever).
+	ResumeConfirmed bool
+
+	// NewSessionRequest is set (project path) when the user confirms a
+	// new-session-into-active-project warning with 'y'. Carries already-
+	// confirmed semantics, like ResumeConfirmed.
+	NewSessionRequest string
+
 	RenameRequest *RenameOp
 }
 
@@ -52,7 +63,8 @@ type OverlayModel struct {
 	sessByDir map[string]map[string]data.SessionInfo
 
 	// ACTIVE-warning prompt state
-	pendingResume *data.SessionInfo
+	pendingResume     *data.SessionInfo
+	pendingNewSession bool // y in this prompt means "start a NEW session", not resume
 
 	// Rename state
 	renameTarget *data.SessionInfo
@@ -89,11 +101,13 @@ func (m *OverlayModel) OpenContent(sessions []data.SessionInfo) tea.Cmd {
 // OpenHelp shows the help overlay; any key dismisses it.
 func (m *OverlayModel) OpenHelp() { m.Kind = OverlayHelp }
 
-// OpenActiveWarn prompts y/N before resuming into a project that already has
-// a running claude process.
-func (m *OverlayModel) OpenActiveWarn(sess data.SessionInfo) {
+// OpenActiveWarn prompts y/N before launching claude into a project that
+// already has a running claude process. If newSession is true, the warning
+// is for `claude` (no --resume); otherwise it's for `claude --resume <id>`.
+func (m *OverlayModel) OpenActiveWarn(sess data.SessionInfo, newSession bool) {
 	m.Kind = OverlayActiveWarn
 	m.pendingResume = &sess
+	m.pendingNewSession = newSession
 }
 
 // OpenRename opens an input prefilled with the session's current title.
@@ -169,11 +183,18 @@ func (m OverlayModel) Update(msg tea.Msg, keys KeyMap) (OverlayModel, tea.Cmd, O
 			switch t.String() {
 			case "y", "Y":
 				if m.pendingResume != nil {
-					res.ResumeRequest = m.pendingResume
+					if m.pendingNewSession {
+						res.NewSessionRequest = m.pendingResume.Project
+					} else {
+						res.ResumeRequest = m.pendingResume
+						res.ResumeConfirmed = true
+					}
 				}
 				m.Close()
+				m.pendingNewSession = false
 			case "n", "N", "esc":
 				m.Close()
+				m.pendingNewSession = false
 			}
 			return m, nil, res
 
@@ -257,11 +278,15 @@ func (m OverlayModel) View() string {
 		if m.pendingResume == nil {
 			return ""
 		}
+		question := "Resume anyway? (y/N)"
+		if m.pendingNewSession {
+			question = "Start new session anyway? (y/N)"
+		}
 		return style.Render(fmt.Sprintf(
 			"%s\n\n%s\n\n%s",
 			StyleActive.Render("⚠ A claude process is already running in this project."),
 			StyleSession.Render(m.pendingResume.Project),
-			StyleDim.Render("Resume anyway? (y/N)"),
+			StyleDim.Render(question),
 		))
 
 	case OverlayRename:

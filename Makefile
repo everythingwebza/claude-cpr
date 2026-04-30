@@ -4,9 +4,11 @@ BIN := bin/cpr
 INSTALL_PATH := $(HOME)/.local/bin/cpr
 
 build:
+	@mkdir -p $(dir $(BIN))
 	go build -ldflags="-s -w" -o $(BIN) ./
 
 install: build
+	@mkdir -p $(dir $(INSTALL_PATH))
 	install -m 0755 $(BIN) $(INSTALL_PATH)
 	@echo "Installed to $(INSTALL_PATH)"
 

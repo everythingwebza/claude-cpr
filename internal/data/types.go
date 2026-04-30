@@ -1,5 +1,20 @@
 package data
 
+import "regexp"
+
+// validSessionID matches the UUID-ish identifiers Claude Code emits and
+// rejects anything outside that shape. Used to guard against path-traversal
+// (e.g. "../etc/whatever") and option-injection (e.g. "-rf") in any code
+// path that joins a session ID into a filesystem path or argv slot.
+var validSessionID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
+// IsValidSessionID reports whether s is safe to use as a path or argv
+// component. Empty strings, traversal sequences, leading dashes, and
+// over-long inputs are rejected.
+func IsValidSessionID(s string) bool {
+	return validSessionID.MatchString(s)
+}
+
 // SessionInfo aggregates a session's metadata from all sources.
 type SessionInfo struct {
 	Project   string

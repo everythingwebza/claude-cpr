@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -329,29 +330,55 @@ func (m *TreeModel) SetSize(w, h int) {
 	m.adjustScroll()
 }
 
-// shortProjectName returns the last 1-2 meaningful path segments.
+// shortProjectName returns the last 1-2 meaningful path segments of a project
+// path, with the user's $HOME and a small set of generic mount/container
+// segments stripped. The result is purely cosmetic — the full path is still
+// used everywhere internally.
 //
-// The skip list is intentionally specific to this installation's filesystem
-// layout (home/michael/dev/..., /mnt/c/Users/micha/...). Generalise when
-// packaging for distribution; for now it matches the original Python tool.
+// Examples (with HOME=/home/alice):
+//   /home/alice/dev/acme/api          → acme/api
+//   /home/alice/sandbox               → sandbox
+//   /mnt/c/Users/alice/code/foo       → code/foo
+//   /opt/projects/x/y                 → x/y
 func shortProjectName(p string) string {
 	parts := strings.Split(p, "/")
-	skip := map[string]bool{"home": true, "michael": true, "dev": true, "mnt": true, "c": true,
-		"PrivateData": true, "Work": true, "www": true, "Users": true, "micha": true, "": true}
-	out := []string{}
+	skip := projectNameSkipSet()
+	out := make([]string, 0, len(parts))
 	for _, s := range parts {
-		if skip[s] {
+		if s == "" || skip[s] {
 			continue
 		}
 		out = append(out, s)
 	}
-	if len(out) >= 2 {
+	switch {
+	case len(out) >= 2:
 		return out[len(out)-2] + "/" + out[len(out)-1]
-	}
-	if len(out) == 1 {
+	case len(out) == 1:
 		return out[0]
+	default:
+		return p
 	}
-	return p
+}
+
+// projectNameSkipSet returns segments to drop when shortening a path. It
+// derives the user's home segments at call-time and adds generic
+// mount-prefix segments commonly seen on Linux/WSL2.
+func projectNameSkipSet() map[string]bool {
+	skip := map[string]bool{
+		// Common Linux mount roots and Windows-side WSL prefixes.
+		"home": true, "mnt": true, "Users": true,
+		"opt": true, "var": true, "srv": true, "tmp": true,
+		// WSL "/mnt/c" + "/mnt/d" drive letters.
+		"c": true, "d": true,
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		for _, seg := range strings.Split(home, "/") {
+			if seg != "" {
+				skip[seg] = true
+			}
+		}
+	}
+	return skip
 }
 
 func timeAgo(iso string) string {

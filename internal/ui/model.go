@@ -180,7 +180,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var res OverlayResult
 			m.overlay, ocmd, res = m.overlay.Update(msg, m.keys)
 			if res.ResumeRequest != nil {
-				return m, m.execResume(*res.ResumeRequest)
+				return m, m.execResume(*res.ResumeRequest, res.ResumeConfirmed)
+			}
+			if res.NewSessionRequest != "" {
+				return m, m.execNewSessionForced(res.NewSessionRequest)
 			}
 			if res.RenameRequest != nil {
 				m.applyRename(*res.RenameRequest)
@@ -195,6 +198,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.saveState()
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.Esc):
+			if m.err != nil {
+				m.err = nil
+				return m, nil
+			}
 			if m.focus == FocusSearch {
 				m.search.Blur()
 				m.focus = FocusTree
@@ -234,6 +241,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// intercept Enter for resume; pass other keys to tree
 			if key.Matches(msg, m.keys.Enter) {
 				return m.handleEnter()
+			}
+			// New session in the focused project (or the cursor session's
+			// parent project, if the cursor is on a session row). Runs
+			// `claude` (no --resume) in the project directory.
+			if key.Matches(msg, m.keys.NewSess) {
+				row := m.tree.SelectedRow()
+				if row.Project != "" {
+					return m, m.execNewSession(row.Project)
+				}
+				return m, nil
 			}
 			// Pin/unpin the focused project and persist.
 			if key.Matches(msg, m.keys.Pin) {
@@ -307,7 +324,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, LoadCmd(m.store, parts[0], parts[1])
 
 	case openActiveWarnMsg:
-		m.overlay.OpenActiveWarn(msg.sess)
+		m.overlay.OpenActiveWarn(msg.sess, msg.newSession)
 		return m, nil
 
 	case search.ResultsMsg:
@@ -317,13 +334,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var res OverlayResult
 			m.overlay, ocmd, res = m.overlay.Update(msg, m.keys)
 			if res.ResumeRequest != nil {
-				return m, m.execResume(*res.ResumeRequest)
+				return m, m.execResume(*res.ResumeRequest, res.ResumeConfirmed)
 			}
 			return m, ocmd
 		}
 		return m, nil
 
 	case LoadedMsg:
+		// Drop stale loads: if the cursor has moved on while this transcript
+		// was being parsed, pendingLoad will already point elsewhere. Without
+		// this guard the user sees the wrong transcript flash up.
+		expected := msg.Project + "|" + msg.SessionID
+		if m.pendingLoad != "" && m.pendingLoad != expected {
+			return m, nil
+		}
 		// Match the loaded session to a SessionInfo from the current build
 		// so the preview header has the right metadata.
 		var sess *data.SessionInfo
@@ -335,6 +359,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.preview.SetMessages(msg.Messages, sess)
+		return m, nil
+
+	case errMsg:
+		// Surface resume / new-session failures (e.g. claude not on PATH or
+		// project dir gone). Stays visible until the next model action that
+		// clears m.err.
+		m.err = msg.err
 		return m, nil
 	}
 	return m, nil
@@ -389,17 +420,53 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 	if row.Kind != RowSession {
 		return m, nil
 	}
-	return m, m.execResume(row.Session)
+	return m, m.execResume(row.Session, false)
+}
+
+// execNewSession runs `claude` (no --resume) in the project directory, starting
+// a fresh session. Same ACTIVE-warning rule as execResume — if a claude
+// process is already running there, prompt y/N first.
+func (m Model) execNewSession(project string) tea.Cmd {
+	if _, active := m.store.ActiveDirs()[project]; active {
+		return func() tea.Msg {
+			return openActiveWarnMsg{sess: data.SessionInfo{Project: project}, newSession: true}
+		}
+	}
+	return m.execNewSessionForced(project)
+}
+
+// execNewSessionForced is the post-confirmation path — bypasses the active
+// check (used after the user has answered y in the warning overlay).
+func (m Model) execNewSessionForced(project string) tea.Cmd {
+	return tea.ExecProcess(buildClaudeNewCmd(project), func(err error) tea.Msg {
+		if err != nil {
+			return errMsg{err}
+		}
+		return tea.QuitMsg{}
+	})
+}
+
+// buildClaudeNewCmd builds the *exec.Cmd for `claude` (no --resume).
+func buildClaudeNewCmd(project string) *exec.Cmd {
+	claudeBin, _ := exec.LookPath("claude")
+	if claudeBin == "" {
+		claudeBin = "claude"
+	}
+	c := exec.Command(claudeBin)
+	c.Dir = project
+	return c
 }
 
 // execResume kicks off a `claude --resume` exec, OR opens the ACTIVE-warning
-// overlay if a claude process is already running in the project.
-func (m Model) execResume(sess data.SessionInfo) tea.Cmd {
-	if _, active := m.store.ActiveDirs()[sess.Project]; active && m.overlay.Kind == OverlayNone {
-		// Mutate the model's overlay via a thunk: we can't do it inline here
-		// because execResume returns a Cmd, not (Model, Cmd). The caller of
-		// handleEnter handles the model-mutation route directly.
-		return func() tea.Msg { return openActiveWarnMsg{sess: sess} }
+// overlay if a claude process is already running in the project AND the user
+// hasn't already confirmed via the warning.
+func (m Model) execResume(sess data.SessionInfo, confirmed bool) tea.Cmd {
+	if !confirmed {
+		if _, active := m.store.ActiveDirs()[sess.Project]; active {
+			// Mutate the model's overlay via a thunk: we can't do it inline
+			// here because execResume returns a Cmd, not (Model, Cmd).
+			return func() tea.Msg { return openActiveWarnMsg{sess: sess} }
+		}
 	}
 	return tea.ExecProcess(buildClaudeCmd(sess.Project, sess.SessionID), func(err error) tea.Msg {
 		if err != nil {
@@ -410,15 +477,25 @@ func (m Model) execResume(sess data.SessionInfo) tea.Cmd {
 }
 
 // openActiveWarnMsg asks the root Update to surface the ACTIVE-warning
-// overlay for a pending resume. We use a message instead of mutating the
-// model directly so the call site (execResume) can stay a value-receiver
-// helper that returns only a tea.Cmd.
-type openActiveWarnMsg struct{ sess data.SessionInfo }
+// overlay for a pending resume or new-session start. We use a message
+// instead of mutating the model directly so the call site (execResume,
+// execNewSession) can stay a value-receiver helper that returns only a
+// tea.Cmd. newSession=true means the user wants to launch `claude` (no
+// --resume) instead of resuming sess.SessionID.
+type openActiveWarnMsg struct {
+	sess       data.SessionInfo
+	newSession bool
+}
 
 // applyRename writes a new custom-title to the session JSONL, invalidates
 // the cached title in the SessionStore, rebuilds the session list, and
 // refreshes the tree so the new title shows immediately.
 func (m *Model) applyRename(op RenameOp) {
+	// Defence-in-depth: parsers already reject invalid session IDs, but the
+	// rename flow joins the ID into a filesystem path so re-validate here.
+	if !data.IsValidSessionID(op.Session.SessionID) {
+		return
+	}
 	dir := strings.ReplaceAll(op.Session.Project, "/", "-")
 	sessionsRoot := filepath.Join(filepath.Dir(m.statePath), "projects")
 	file := filepath.Join(sessionsRoot, dir, op.Session.SessionID+".jsonl")
@@ -446,9 +523,6 @@ func buildClaudeCmd(project, sessionID string) *exec.Cmd {
 func (m Model) View() string {
 	if m.quitting {
 		return ""
-	}
-	if m.err != nil {
-		return fmt.Sprintf("error: %v\n", m.err)
 	}
 	if m.width < 60 || m.height < 10 {
 		return "terminal too small (need ≥ 60×10)\n"
@@ -487,8 +561,12 @@ func (m Model) View() string {
 }
 
 func (m Model) footer() string {
+	if m.err != nil {
+		return StyleActive.Render(fmt.Sprintf(" error: %v ", m.err)) +
+			StyleHelpDesc.Render("(Esc to dismiss)")
+	}
 	return StyleHelpDesc.Render(
-		" ↑↓ nav  ←→ collapse/expand  Enter resume  type=filter  /=content  p=preview  ?=help  Esc=quit",
+		" ↑↓ nav  ←→ collapse/expand  Enter resume  n new  /=content  p=preview  ?=help  Esc=quit",
 	)
 }
 
