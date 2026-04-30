@@ -124,7 +124,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if key.Matches(msg, m.keys.Enter) {
 				return m.handleEnter()
 			}
-			// any printable char focuses search instead of tree
+			// Tree-navigation keys (arrows AND their vim-style aliases h/j/k/l)
+			// route to the tree even though h/j/k/l are technically printable.
+			// Without this, vim-style nav characters would jump to the search
+			// bar instead of moving the cursor.
+			if isTreeNavKey(msg, m.keys) {
+				var cmd tea.Cmd
+				m.tree, cmd = m.tree.Update(msg, m.keys)
+				return m, cmd
+			}
+			// Any other printable char focuses the search bar.
 			if isPrintable(msg) {
 				cmd := m.search.Focus()
 				m.focus = FocusSearch
@@ -132,6 +141,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.tree.SetFilter(m.search.Value())
 				return m, cmd
 			}
+			// Non-printable special keys (PgUp/PgDn/Home/End/etc.) → tree.
 			var cmd tea.Cmd
 			m.tree, cmd = m.tree.Update(msg, m.keys)
 			return m, cmd
@@ -149,7 +159,9 @@ func (m *Model) layout() {
 	}
 	leftW := m.width * 45 / 100
 	rightW := m.width - leftW - 4
-	bodyH := m.height - 3 // search bar + footer
+	// Chrome rows: search bar (1 input + 1 bottom border = 2) +
+	// pane top/bottom borders (2) + footer (1) = 5.
+	bodyH := m.height - 5 // search bar + footer
 	m.tree.SetSize(leftW-2, bodyH)
 	m.preview.SetSize(rightW-2, bodyH)
 }
@@ -196,7 +208,9 @@ func (m Model) View() string {
 	}
 	leftW := m.width * 45 / 100
 	rightW := m.width - leftW - 4
-	bodyH := m.height - 3
+	// Chrome rows: search bar (1 input + 1 bottom border = 2) +
+	// pane top/bottom borders (2) + footer (1) = 5.
+	bodyH := m.height - 5
 
 	leftStyle := StylePane.Width(leftW).Height(bodyH)
 	rightStyle := StylePane.Width(rightW).Height(bodyH)
@@ -230,4 +244,13 @@ func isPrintable(k tea.KeyMsg) bool {
 	}
 	r := k.Runes[0]
 	return r >= ' ' && r != 127
+}
+
+// isTreeNavKey returns true for any binding that the tree pane handles directly,
+// including vim-style aliases (h/j/k/l) that are otherwise printable runes.
+func isTreeNavKey(msg tea.KeyMsg, keys KeyMap) bool {
+	return key.Matches(msg, keys.Up) ||
+		key.Matches(msg, keys.Down) ||
+		key.Matches(msg, keys.Left) ||
+		key.Matches(msg, keys.Right)
 }
