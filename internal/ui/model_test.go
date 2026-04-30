@@ -31,6 +31,28 @@ func TestModelUpdate_ArrowDownMovesTreeCursor(t *testing.T) {
 	}
 }
 
+func TestModelUpdate_OldDebounceMsgIsIgnored(t *testing.T) {
+	// A DebounceMsg whose Seq is older than the model's current debounceSeq
+	// must be a no-op (otherwise rapid cursor scrolling would fire many
+	// expensive transcript loads).
+	m := Model{
+		tree:        NewTreeModel(nil, nil, nil, SortRecent),
+		search:      NewSearchModel(),
+		preview:     NewPreviewModel(),
+		keys:        DefaultKeyMap(),
+		focus:       FocusTree,
+		debounceSeq: 5,
+		pendingLoad: "/p|s",
+	}
+	next, cmd := m.Update(DebounceMsg{Seq: 3}) // older
+	if cmd != nil {
+		t.Errorf("stale DebounceMsg should not produce a cmd, got %T", cmd)
+	}
+	if next.(Model).pendingLoad != "/p|s" {
+		t.Errorf("pendingLoad mutated unexpectedly")
+	}
+}
+
 func TestModelView_FitsExactlyInTerminalHeight(t *testing.T) {
 	// Drive a WindowSizeMsg through Update, then assert View() output is no
 	// taller than the reported terminal height. Lipgloss's alt-screen will

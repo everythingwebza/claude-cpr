@@ -3,12 +3,18 @@ package ui
 import (
 	"fmt"
 	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/everythingwebza/claude-cpr/internal/data"
 )
+
+// previewDebounce is the delay between cursor settling on a session and the
+// preview pane firing its async transcript load.
+const previewDebounce = 150 * time.Millisecond
 
 type Focus int
 
@@ -30,6 +36,11 @@ type Model struct {
 	width, height int
 	quitting      bool
 	err           error
+
+	// Preview debounce state. debounceSeq is bumped on every cursor move so
+	// older pending DebounceMsgs ignore themselves on arrival.
+	debounceSeq int64
+	pendingLoad string // "project|sessionID"
 }
 
 func NewModel(store *data.SessionStore) (Model, error) {
@@ -75,14 +86,19 @@ func defaultExpansion(sessions []data.SessionInfo, n int) map[string]bool {
 	return out
 }
 
-func (m Model) Init() tea.Cmd { return nil }
+func (m Model) Init() tea.Cmd {
+	// Bubble Tea calls Init once on program start; we defer the first preview
+	// load to the WindowSizeMsg path so the model has known dimensions and a
+	// settled cursor before scheduling the load.
+	return nil
+}
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
-		return m, nil
+		return m, m.scheduleLoad()
 
 	case tea.KeyMsg:
 		// global keys first
@@ -114,7 +130,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.search, cmd = m.search.Update(msg, m.keys)
 			m.tree.SetFilter(m.search.Value())
-			return m, cmd
+			return m, tea.Batch(cmd, m.scheduleLoad())
 		case FocusPreview:
 			var cmd tea.Cmd
 			m.preview, cmd = m.preview.Update(msg, m.keys)
@@ -131,7 +147,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if isTreeNavKey(msg, m.keys) {
 				var cmd tea.Cmd
 				m.tree, cmd = m.tree.Update(msg, m.keys)
-				return m, cmd
+				return m, tea.Batch(cmd, m.scheduleLoad())
 			}
 			// Any other printable char focuses the search bar.
 			if isPrintable(msg) {
@@ -139,18 +155,66 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = FocusSearch
 				m.search, _ = m.search.Update(msg, m.keys)
 				m.tree.SetFilter(m.search.Value())
-				return m, cmd
+				return m, tea.Batch(cmd, m.scheduleLoad())
 			}
 			// Non-printable special keys (PgUp/PgDn/Home/End/etc.) → tree.
 			var cmd tea.Cmd
 			m.tree, cmd = m.tree.Update(msg, m.keys)
-			return m, cmd
+			return m, tea.Batch(cmd, m.scheduleLoad())
 		}
 
 	case tea.MouseMsg:
 		return m, nil
+
+	case DebounceMsg:
+		// Older debounce ticks ignore themselves once a newer cursor move
+		// has bumped the seq.
+		if msg.Seq != m.debounceSeq {
+			return m, nil
+		}
+		parts := strings.SplitN(m.pendingLoad, "|", 2)
+		if len(parts) != 2 {
+			return m, nil
+		}
+		return m, LoadCmd(m.store, parts[0], parts[1])
+
+	case LoadedMsg:
+		// Match the loaded session to a SessionInfo from the current build
+		// so the preview header has the right metadata.
+		var sess *data.SessionInfo
+		sessions, _ := m.store.Build()
+		for i := range sessions {
+			if sessions[i].SessionID == msg.SessionID && sessions[i].Project == msg.Project {
+				sess = &sessions[i]
+				break
+			}
+		}
+		m.preview.SetMessages(msg.Messages, sess)
+		return m, nil
 	}
 	return m, nil
+}
+
+// scheduleLoad starts a debounce timer for the cursor's current session row.
+// If the cursor is on a project (or no row), the preview is cleared.
+func (m *Model) scheduleLoad() tea.Cmd {
+	row := m.tree.SelectedRow()
+	if row.Kind != RowSession {
+		// No active session under cursor — clear so a stale preview isn't shown.
+		if m.preview.Current() != nil {
+			m.preview.Clear()
+		}
+		m.pendingLoad = ""
+		return nil
+	}
+	// If we're already showing this session, no need to re-load.
+	if cur := m.preview.Current(); cur != nil &&
+		cur.SessionID == row.Session.SessionID && cur.Project == row.Project {
+		return nil
+	}
+	m.debounceSeq++
+	m.pendingLoad = row.Project + "|" + row.Session.SessionID
+	return DebounceCmd(previewDebounce, m.debounceSeq)
 }
 
 func (m *Model) layout() {
