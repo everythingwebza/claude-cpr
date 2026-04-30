@@ -228,6 +228,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if key.Matches(msg, m.keys.Enter) {
 				return m.handleEnter()
 			}
+			// Pin/unpin the focused project and persist.
+			if key.Matches(msg, m.keys.Pin) {
+				row := m.tree.SelectedRow()
+				if row.Kind == RowProject {
+					m.tree.pinned[row.Project] = !m.tree.pinned[row.Project]
+					if !m.tree.pinned[row.Project] {
+						delete(m.tree.pinned, row.Project)
+					}
+					m.saveState()
+				}
+				return m, nil
+			}
+			// Cycle sort mode and persist: recent → msgcount → alpha → recent.
+			if key.Matches(msg, m.keys.Sort) {
+				switch m.tree.sort {
+				case SortRecent:
+					m.tree.sort = SortMsgCount
+				case SortMsgCount:
+					m.tree.sort = SortAlpha
+				default:
+					m.tree.sort = SortRecent
+				}
+				m.saveState()
+				return m, nil
+			}
 			// Tree-navigation keys (arrows AND their vim-style aliases h/j/k/l)
 			// route to the tree even though h/j/k/l are technically printable.
 			// Without this, vim-style nav characters would jump to the search
