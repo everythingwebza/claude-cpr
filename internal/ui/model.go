@@ -2,7 +2,9 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/everythingwebza/claude-cpr/internal/data"
 	"github.com/everythingwebza/claude-cpr/internal/search"
+	"github.com/everythingwebza/claude-cpr/internal/state"
 )
 
 // previewDebounce is the delay between cursor settling on a session and the
@@ -43,6 +46,9 @@ type Model struct {
 	// older pending DebounceMsgs ignore themselves on arrival.
 	debounceSeq int64
 	pendingLoad string // "project|sessionID"
+
+	state     state.State
+	statePath string
 }
 
 func NewModel(store *data.SessionStore) (Model, error) {
@@ -50,16 +56,50 @@ func NewModel(store *data.SessionStore) (Model, error) {
 	if err != nil {
 		return Model{}, err
 	}
+	home, _ := os.UserHomeDir()
+	statePath := filepath.Join(home, ".claude", ".cpr-state.json")
+	st, _ := state.Load(statePath)
+
 	expanded := defaultExpansion(sessions, 2)
-	tree := NewTreeModel(sessions, expanded, store.ActiveDirs(), SortRecent)
+	if len(st.Expanded) > 0 {
+		expanded = st.Expanded
+	}
+	tree := NewTreeModel(sessions, expanded, store.ActiveDirs(), SortMode(st.SortMode))
+	if SortMode(st.SortMode) == "" {
+		tree.sort = SortRecent
+	}
+	for _, p := range st.Pinned {
+		tree.pinned[p] = true
+	}
+
+	// Restore cursor by finding the row matching the saved LastCursor.
+	if st.LastCursor.SessionID != "" || st.LastCursor.Project != "" {
+		rows := tree.flatten("")
+		for i, r := range rows {
+			if r.Kind == RowSession &&
+				r.Session.SessionID == st.LastCursor.SessionID &&
+				r.Project == st.LastCursor.Project {
+				tree.cursor = i
+				break
+			}
+			if r.Kind == RowProject && st.LastCursor.SessionID == "" &&
+				r.Project == st.LastCursor.Project {
+				tree.cursor = i
+				break
+			}
+		}
+	}
+
 	return Model{
-		store:   store,
-		keys:    DefaultKeyMap(),
-		tree:    tree,
-		search:  NewSearchModel(),
-		preview: NewPreviewModel(),
-		overlay: NewOverlay(),
-		focus:   FocusTree,
+		store:     store,
+		keys:      DefaultKeyMap(),
+		tree:      tree,
+		search:    NewSearchModel(),
+		preview:   NewPreviewModel(),
+		overlay:   NewOverlay(),
+		focus:     FocusTree,
+		state:     st,
+		statePath: statePath,
 	}, nil
 }
 
@@ -85,6 +125,32 @@ func defaultExpansion(sessions []data.SessionInfo, n int) map[string]bool {
 	}
 	for _, p := range seen {
 		out[p] = true
+	}
+	return out
+}
+
+// saveState mirrors current model state to disk. Errors are silent (the user
+// shouldn't be blocked by state-file failures).
+func (m *Model) saveState() {
+	row := m.tree.SelectedRow()
+	switch row.Kind {
+	case RowSession:
+		m.state.LastCursor = state.Cursor{Project: row.Project, SessionID: row.Session.SessionID}
+	case RowProject:
+		m.state.LastCursor = state.Cursor{Project: row.Project}
+	}
+	m.state.Expanded = m.tree.expanded
+	m.state.SortMode = string(m.tree.sort)
+	m.state.Pinned = collectPinned(m.tree.pinned)
+	_ = state.Save(m.statePath, m.state)
+}
+
+func collectPinned(m map[string]bool) []string {
+	out := []string{}
+	for k, v := range m {
+		if v {
+			out = append(out, k)
+		}
 	}
 	return out
 }
@@ -119,6 +185,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case key.Matches(msg, m.keys.Quit):
 			m.quitting = true
+			m.saveState()
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.Esc):
 			if m.focus == FocusSearch {
@@ -127,6 +194,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.quitting = true
+			m.saveState()
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.Help):
 			m.overlay.OpenHelp()
