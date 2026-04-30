@@ -24,13 +24,20 @@ const (
 	OverlayContentInput
 	OverlayContentResults
 	OverlayActiveWarn
+	OverlayRename
 )
 
+// RenameOp carries a session and the new title the user typed.
+type RenameOp struct {
+	Session  data.SessionInfo
+	NewTitle string
+}
+
 // OverlayResult is what the overlay returns to the root model — actions the
-// root needs to take (e.g., resume a session) once the overlay's interaction
-// is settled.
+// root needs to take (resume, rename) once the overlay's interaction settles.
 type OverlayResult struct {
 	ResumeRequest *data.SessionInfo
+	RenameRequest *RenameOp
 }
 
 type OverlayModel struct {
@@ -46,6 +53,9 @@ type OverlayModel struct {
 
 	// ACTIVE-warning prompt state
 	pendingResume *data.SessionInfo
+
+	// Rename state
+	renameTarget *data.SessionInfo
 }
 
 func NewOverlay() OverlayModel {
@@ -84,6 +94,16 @@ func (m *OverlayModel) OpenHelp() { m.Kind = OverlayHelp }
 func (m *OverlayModel) OpenActiveWarn(sess data.SessionInfo) {
 	m.Kind = OverlayActiveWarn
 	m.pendingResume = &sess
+}
+
+// OpenRename opens an input prefilled with the session's current title.
+func (m *OverlayModel) OpenRename(sess data.SessionInfo) tea.Cmd {
+	m.Kind = OverlayRename
+	m.renameTarget = &sess
+	m.input.Prompt = "rename session: "
+	m.input.SetValue(sess.Title)
+	m.input.CursorEnd()
+	return m.input.Focus()
 }
 
 // Close dismisses any overlay.
@@ -156,6 +176,27 @@ func (m OverlayModel) Update(msg tea.Msg, keys KeyMap) (OverlayModel, tea.Cmd, O
 				m.Close()
 			}
 			return m, nil, res
+
+		case OverlayRename:
+			if key.Matches(t, keys.Esc) {
+				m.Close()
+				m.input.Prompt = "search content: " // restore default
+				return m, nil, res
+			}
+			if t.Type == tea.KeyEnter {
+				if m.renameTarget != nil {
+					res.RenameRequest = &RenameOp{
+						Session:  *m.renameTarget,
+						NewTitle: m.input.Value(),
+					}
+				}
+				m.Close()
+				m.input.Prompt = "search content: "
+				return m, nil, res
+			}
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd, res
 		}
 
 	case search.ResultsMsg:
@@ -222,6 +263,9 @@ func (m OverlayModel) View() string {
 			StyleSession.Render(m.pendingResume.Project),
 			StyleDim.Render("Resume anyway? (y/N)"),
 		))
+
+	case OverlayRename:
+		return style.Render(m.input.View() + "\n\n" + StyleDim.Render("Enter to save · Esc to cancel"))
 	}
 	return ""
 }

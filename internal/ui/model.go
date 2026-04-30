@@ -178,6 +178,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if res.ResumeRequest != nil {
 				return m, m.execResume(*res.ResumeRequest)
 			}
+			if res.RenameRequest != nil {
+				m.applyRename(*res.RenameRequest)
+			}
 			return m, ocmd
 		}
 
@@ -237,6 +240,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						delete(m.tree.pinned, row.Project)
 					}
 					m.saveState()
+				}
+				return m, nil
+			}
+			// Rename the focused session by writing a new custom-title line.
+			if key.Matches(msg, m.keys.Rename) {
+				row := m.tree.SelectedRow()
+				if row.Kind == RowSession {
+					return m, m.overlay.OpenRename(row.Session)
 				}
 				return m, nil
 			}
@@ -399,6 +410,22 @@ func (m Model) execResume(sess data.SessionInfo) tea.Cmd {
 // model directly so the call site (execResume) can stay a value-receiver
 // helper that returns only a tea.Cmd.
 type openActiveWarnMsg struct{ sess data.SessionInfo }
+
+// applyRename writes a new custom-title to the session JSONL, invalidates
+// the cached title in the SessionStore, rebuilds the session list, and
+// refreshes the tree so the new title shows immediately.
+func (m *Model) applyRename(op RenameOp) {
+	dir := strings.ReplaceAll(op.Session.Project, "/", "-")
+	sessionsRoot := filepath.Join(filepath.Dir(m.statePath), "projects")
+	file := filepath.Join(sessionsRoot, dir, op.Session.SessionID+".jsonl")
+	if err := data.WriteCustomTitle(file, op.NewTitle); err != nil {
+		return // silent: failure leaves the title unchanged
+	}
+	m.store.InvalidateCustomTitle(file)
+	if sessions, err := m.store.Build(); err == nil {
+		m.tree.sessions = sessions
+	}
+}
 
 type errMsg struct{ err error }
 

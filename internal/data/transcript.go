@@ -129,7 +129,30 @@ func contentToText(raw json.RawMessage) string {
 	return strings.TrimSpace(b.String())
 }
 
-// extractCustomTitle returns the first custom-title value, or "" if none.
+// WriteCustomTitle appends a {"type":"custom-title", ...} line to the session
+// JSONL. Same mechanism Claude itself uses; first occurrence wins on read.
+func WriteCustomTitle(sessionFile, title string) error {
+	f, err := os.OpenFile(sessionFile, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	line, err := json.Marshal(map[string]string{
+		"type":        "custom-title",
+		"customTitle": title,
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+// extractCustomTitle returns the LAST custom-title value (rename via
+// WriteCustomTitle appends, so the latest line is the live title), or ""
+// if none.
 func extractCustomTitle(sessionFile string) (string, error) {
 	f, err := os.Open(sessionFile)
 	if err != nil {
@@ -142,6 +165,7 @@ func extractCustomTitle(sessionFile string) (string, error) {
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	last := ""
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
@@ -155,8 +179,8 @@ func extractCustomTitle(sessionFile string) (string, error) {
 			continue
 		}
 		if d.Type == "custom-title" {
-			return d.CustomTitle, nil
+			last = d.CustomTitle
 		}
 	}
-	return "", nil
+	return last, nil
 }
