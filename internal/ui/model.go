@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/everythingwebza/claude-cpr/internal/data"
+	"github.com/everythingwebza/claude-cpr/internal/search"
 )
 
 // previewDebounce is the delay between cursor settling on a session and the
@@ -31,6 +32,7 @@ type Model struct {
 	tree    TreeModel
 	search  SearchModel
 	preview PreviewModel
+	overlay OverlayModel
 	focus   Focus
 
 	width, height int
@@ -56,6 +58,7 @@ func NewModel(store *data.SessionStore) (Model, error) {
 		tree:    tree,
 		search:  NewSearchModel(),
 		preview: NewPreviewModel(),
+		overlay: NewOverlay(),
 		focus:   FocusTree,
 	}, nil
 }
@@ -101,6 +104,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.scheduleLoad()
 
 	case tea.KeyMsg:
+		// Active overlay swallows all key input until it closes itself.
+		if m.overlay.Kind != OverlayNone {
+			var ocmd tea.Cmd
+			var res OverlayResult
+			m.overlay, ocmd, res = m.overlay.Update(msg, m.keys)
+			if res.ResumeRequest != nil {
+				return m, m.execResume(*res.ResumeRequest)
+			}
+			return m, ocmd
+		}
+
 		// global keys first
 		switch {
 		case key.Matches(msg, m.keys.Quit):
@@ -114,6 +128,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.quitting = true
 			return m, tea.Quit
+		case key.Matches(msg, m.keys.Help):
+			m.overlay.OpenHelp()
+			return m, nil
+		case key.Matches(msg, m.keys.Search):
+			sessions, _ := m.store.Build()
+			return m, m.overlay.OpenContent(sessions)
 		case key.Matches(msg, m.keys.PreviewFocus) && m.focus != FocusSearch:
 			switch m.focus {
 			case FocusTree:
@@ -177,6 +197,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, LoadCmd(m.store, parts[0], parts[1])
+
+	case openActiveWarnMsg:
+		m.overlay.OpenActiveWarn(msg.sess)
+		return m, nil
+
+	case search.ResultsMsg:
+		// Async content-search result. Forward to the overlay if it's open.
+		if m.overlay.Kind == OverlayContentResults || m.overlay.Kind == OverlayContentInput {
+			var ocmd tea.Cmd
+			var res OverlayResult
+			m.overlay, ocmd, res = m.overlay.Update(msg, m.keys)
+			if res.ResumeRequest != nil {
+				return m, m.execResume(*res.ResumeRequest)
+			}
+			return m, ocmd
+		}
+		return m, nil
 
 	case LoadedMsg:
 		// Match the loaded session to a SessionInfo from the current build
@@ -244,14 +281,31 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 	if row.Kind != RowSession {
 		return m, nil
 	}
-	// ACTIVE warning is added in Task 13. For now, just exec.
-	return m, tea.ExecProcess(buildClaudeCmd(row.Project, row.Session.SessionID), func(err error) tea.Msg {
+	return m, m.execResume(row.Session)
+}
+
+// execResume kicks off a `claude --resume` exec, OR opens the ACTIVE-warning
+// overlay if a claude process is already running in the project.
+func (m Model) execResume(sess data.SessionInfo) tea.Cmd {
+	if _, active := m.store.ActiveDirs()[sess.Project]; active && m.overlay.Kind == OverlayNone {
+		// Mutate the model's overlay via a thunk: we can't do it inline here
+		// because execResume returns a Cmd, not (Model, Cmd). The caller of
+		// handleEnter handles the model-mutation route directly.
+		return func() tea.Msg { return openActiveWarnMsg{sess: sess} }
+	}
+	return tea.ExecProcess(buildClaudeCmd(sess.Project, sess.SessionID), func(err error) tea.Msg {
 		if err != nil {
 			return errMsg{err}
 		}
 		return tea.QuitMsg{}
 	})
 }
+
+// openActiveWarnMsg asks the root Update to surface the ACTIVE-warning
+// overlay for a pending resume. We use a message instead of mutating the
+// model directly so the call site (execResume) can stay a value-receiver
+// helper that returns only a tea.Cmd.
+type openActiveWarnMsg struct{ sess data.SessionInfo }
 
 type errMsg struct{ err error }
 
@@ -294,11 +348,18 @@ func (m Model) View() string {
 		leftStyle.Render(m.tree.View()),
 		rightStyle.Render(m.preview.View()),
 	)
-	return lipgloss.JoinVertical(lipgloss.Left,
+	main := lipgloss.JoinVertical(lipgloss.Left,
 		m.search.View(),
 		body,
 		m.footer(),
 	)
+	if m.overlay.Kind != OverlayNone {
+		// Center the overlay over the main view.
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+			m.overlay.View(),
+			lipgloss.WithWhitespaceChars(" "))
+	}
+	return main
 }
 
 func (m Model) footer() string {
