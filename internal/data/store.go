@@ -140,12 +140,12 @@ func (s *SessionStore) merge() []SessionInfo {
 				modified = msToRFC3339(agg.LastTS)
 			}
 			entry := s.indexEntries[indexKey{proj, sid}]
-			title := s.cachedCustomTitle(file)
+			title := normalizeTitle(s.cachedCustomTitle(file))
 			if title == "" {
-				title = entry.Summary
+				title = normalizeTitle(entry.Summary)
 			}
 			if title == "" {
-				title = agg.LastPrompt
+				title = normalizeTitle(agg.LastPrompt)
 			}
 			if title == "" {
 				title = "(untitled)"
@@ -169,9 +169,9 @@ func (s *SessionStore) merge() []SessionInfo {
 		if e.Modified == "" {
 			continue
 		}
-		title := e.Summary
+		title := normalizeTitle(e.Summary)
 		if title == "" {
-			title = e.FirstPrompt
+			title = normalizeTitle(e.FirstPrompt)
 		}
 		if title == "" {
 			title = "(untitled)"
