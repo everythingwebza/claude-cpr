@@ -23,8 +23,7 @@ uninstall:
 	rm -f $(INSTALL_PATH)
 
 bootstrap:
-	@echo "One-time setup steps:"
-	@echo "  1. Ensure Go 1.22+ is installed: go version"
-	@echo "  2. make install"
-	@echo "  3. Edit ~/.bashrc and remove: alias cpr='claude-projects'"
-	@echo "  4. New shell, type 'cpr'."
+	@command -v go >/dev/null 2>&1 || { echo "Install Go 1.22+ first: https://go.dev/dl/"; exit 1; }
+	@command -v rg >/dev/null 2>&1 || echo "(optional) for fast content search: sudo apt install ripgrep"
+	go mod download
+	@echo "Bootstrap OK. Run 'make install' next."
