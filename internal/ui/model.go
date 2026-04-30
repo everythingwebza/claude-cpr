@@ -130,8 +130,12 @@ func defaultExpansion(sessions []data.SessionInfo, n int) map[string]bool {
 }
 
 // saveState mirrors current model state to disk. Errors are silent (the user
-// shouldn't be blocked by state-file failures).
+// shouldn't be blocked by state-file failures). No-op if statePath is empty,
+// which happens in tests that construct Model{} without a real config path.
 func (m *Model) saveState() {
+	if m.statePath == "" {
+		return
+	}
 	row := m.tree.SelectedRow()
 	switch row.Kind {
 	case RowSession:
