@@ -299,25 +299,44 @@ func (m TreeModel) renderRow(r Row) string {
 		}
 		return fmt.Sprintf("%s %s %s", glyph, marker, StyleProject.Render(shortProjectName(r.Project)))
 	case RowSession:
+		// Build the meta (age + msg count + branch) first and reserve its
+		// width, then let the title absorb whatever space is left. Rendering
+		// the title first (the old behaviour) meant a long title pushed the
+		// meta past m.width, where View's final truncation clipped it — so a
+		// "397 msgs" session displayed as "· 39". The meta now always survives.
+		ago := timeAgo(r.Session.Modified)
+		meta := ago
+		if r.Session.MsgCount > 0 {
+			meta += fmt.Sprintf(" · %d msgs", r.Session.MsgCount)
+		}
+		branchPlain := ""
+		if r.Session.Branch != "" {
+			branchPlain = " " + r.Session.Branch
+		}
+
+		const indent = 4
 		title := r.Session.Title
-		// TODO: derive truncation width from m.width (minus indent + meta).
-		// 50 is a reasonable default for 80-column terminals.
-		if len(title) > 50 {
+		if m.width > 0 {
+			// indent + space-before-meta(1) + meta + branch must fit; the rest is title.
+			avail := m.width - indent - 1 - ansi.StringWidth(meta) - ansi.StringWidth(branchPlain)
+			if avail < 0 {
+				avail = 0
+			}
+			if ansi.StringWidth(title) > avail {
+				title = ansi.Truncate(title, avail, "…")
+			}
+		} else if len(title) > 50 {
+			// No width known (e.g. tests before SetSize): historical 50-col cap.
 			title = title[:47] + "..."
 		}
-		ago := timeAgo(r.Session.Modified)
-		msg := ""
-		if r.Session.MsgCount > 0 {
-			msg = fmt.Sprintf(" · %d msgs", r.Session.MsgCount)
-		}
+
 		branch := ""
 		if r.Session.Branch != "" {
 			branch = " " + StyleBranch.Render(r.Session.Branch)
 		}
-		return fmt.Sprintf("    %s %s%s%s",
+		return fmt.Sprintf("    %s %s%s",
 			StyleSession.Render(title),
-			StyleDim.Render(ago),
-			StyleDim.Render(msg),
+			StyleDim.Render(meta),
 			branch)
 	}
 	return ""
@@ -336,10 +355,11 @@ func (m *TreeModel) SetSize(w, h int) {
 // used everywhere internally.
 //
 // Examples (with HOME=/home/alice):
-//   /home/alice/dev/acme/api          → acme/api
-//   /home/alice/sandbox               → sandbox
-//   /mnt/c/Users/alice/code/foo       → code/foo
-//   /opt/projects/x/y                 → x/y
+//
+//	/home/alice/dev/acme/api          → acme/api
+//	/home/alice/sandbox               → sandbox
+//	/mnt/c/Users/alice/code/foo       → code/foo
+//	/opt/projects/x/y                 → x/y
 func shortProjectName(p string) string {
 	parts := strings.Split(p, "/")
 	skip := projectNameSkipSet()

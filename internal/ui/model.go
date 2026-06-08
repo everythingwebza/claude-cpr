@@ -49,7 +49,26 @@ type Model struct {
 
 	state     state.State
 	statePath string
+
+	// pendingExec, when set, tells main() to replace the cpr process with
+	// `claude` via syscall.Exec AFTER the Bubble Tea program has torn down and
+	// restored the terminal. This is the difference between "cpr stays parked
+	// as claude's parent" (the old tea.ExecProcess behaviour) and "cpr becomes
+	// claude" (no lingering process), which is what the README always promised.
+	pendingExec *ExecRequest
 }
+
+// ExecRequest is a resolved request to replace the cpr process with a `claude`
+// invocation. main() reads it after p.Run() returns and performs the exec.
+type ExecRequest struct {
+	Bin  string   // absolute path to the claude binary (no PATH search at exec time)
+	Args []string // full argv, including Args[0] == Bin
+	Dir  string   // working directory to chdir into before exec
+}
+
+// ExecRequest returns the pending exec target set by a resume / new-session
+// action, or nil if the user quit normally.
+func (m Model) ExecRequest() *ExecRequest { return m.pendingExec }
 
 func NewModel(store *data.SessionStore) (Model, error) {
 	sessions, err := store.Build()
@@ -180,10 +199,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var res OverlayResult
 			m.overlay, ocmd, res = m.overlay.Update(msg, m.keys)
 			if res.ResumeRequest != nil {
-				return m, m.execResume(*res.ResumeRequest, res.ResumeConfirmed)
+				return m.execResume(*res.ResumeRequest, res.ResumeConfirmed)
 			}
 			if res.NewSessionRequest != "" {
-				return m, m.execNewSessionForced(res.NewSessionRequest)
+				return m.execNewSessionForced(res.NewSessionRequest)
 			}
 			if res.RenameRequest != nil {
 				m.applyRename(*res.RenameRequest)
@@ -248,7 +267,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if key.Matches(msg, m.keys.NewSess) {
 				row := m.tree.SelectedRow()
 				if row.Project != "" {
-					return m, m.execNewSession(row.Project)
+					return m.execNewSession(row.Project)
 				}
 				return m, nil
 			}
@@ -334,7 +353,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var res OverlayResult
 			m.overlay, ocmd, res = m.overlay.Update(msg, m.keys)
 			if res.ResumeRequest != nil {
-				return m, m.execResume(*res.ResumeRequest, res.ResumeConfirmed)
+				return m.execResume(*res.ResumeRequest, res.ResumeConfirmed)
 			}
 			return m, ocmd
 		}
@@ -420,15 +439,15 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 	if row.Kind != RowSession {
 		return m, nil
 	}
-	return m, m.execResume(row.Session, false)
+	return m.execResume(row.Session, false)
 }
 
 // execNewSession runs `claude` (no --resume) in the project directory, starting
 // a fresh session. Same ACTIVE-warning rule as execResume — if a claude
 // process is already running there, prompt y/N first.
-func (m Model) execNewSession(project string) tea.Cmd {
+func (m Model) execNewSession(project string) (tea.Model, tea.Cmd) {
 	if _, active := m.store.ActiveDirs()[project]; active {
-		return func() tea.Msg {
+		return m, func() tea.Msg {
 			return openActiveWarnMsg{sess: data.SessionInfo{Project: project}, newSession: true}
 		}
 	}
@@ -437,43 +456,41 @@ func (m Model) execNewSession(project string) tea.Cmd {
 
 // execNewSessionForced is the post-confirmation path — bypasses the active
 // check (used after the user has answered y in the warning overlay).
-func (m Model) execNewSessionForced(project string) tea.Cmd {
-	return tea.ExecProcess(buildClaudeNewCmd(project), func(err error) tea.Msg {
-		if err != nil {
-			return errMsg{err}
-		}
-		return tea.QuitMsg{}
-	})
+func (m Model) execNewSessionForced(project string) (tea.Model, tea.Cmd) {
+	return m.requestExec(project, nil)
 }
 
-// buildClaudeNewCmd builds the *exec.Cmd for `claude` (no --resume).
-func buildClaudeNewCmd(project string) *exec.Cmd {
-	claudeBin, _ := exec.LookPath("claude")
-	if claudeBin == "" {
-		claudeBin = "claude"
-	}
-	c := exec.Command(claudeBin)
-	c.Dir = project
-	return c
-}
-
-// execResume kicks off a `claude --resume` exec, OR opens the ACTIVE-warning
+// execResume requests a `claude --resume` exec, OR opens the ACTIVE-warning
 // overlay if a claude process is already running in the project AND the user
 // hasn't already confirmed via the warning.
-func (m Model) execResume(sess data.SessionInfo, confirmed bool) tea.Cmd {
+func (m Model) execResume(sess data.SessionInfo, confirmed bool) (tea.Model, tea.Cmd) {
 	if !confirmed {
 		if _, active := m.store.ActiveDirs()[sess.Project]; active {
-			// Mutate the model's overlay via a thunk: we can't do it inline
-			// here because execResume returns a Cmd, not (Model, Cmd).
-			return func() tea.Msg { return openActiveWarnMsg{sess: sess} }
+			return m, func() tea.Msg { return openActiveWarnMsg{sess: sess} }
 		}
 	}
-	return tea.ExecProcess(buildClaudeCmd(sess.Project, sess.SessionID), func(err error) tea.Msg {
-		if err != nil {
-			return errMsg{err}
-		}
-		return tea.QuitMsg{}
-	})
+	return m.requestExec(sess.Project, []string{"--resume", sess.SessionID})
+}
+
+// requestExec resolves the claude binary, records the exec target on the model,
+// persists state, and quits the Bubble Tea program. main() then chdirs and
+// replaces the process via syscall.Exec, so no cpr parent lingers behind the
+// claude session. If claude isn't on PATH the error is surfaced in the TUI and
+// no quit happens (resolving here, not in main, lets us stay interactive).
+func (m Model) requestExec(project string, extraArgs []string) (tea.Model, tea.Cmd) {
+	bin, err := exec.LookPath("claude")
+	if err != nil || bin == "" {
+		m.err = fmt.Errorf("claude not found on PATH")
+		return m, nil
+	}
+	m.pendingExec = &ExecRequest{
+		Bin:  bin,
+		Args: append([]string{bin}, extraArgs...),
+		Dir:  project,
+	}
+	m.quitting = true
+	m.saveState()
+	return m, tea.Quit
 }
 
 // openActiveWarnMsg asks the root Update to surface the ACTIVE-warning
@@ -509,16 +526,6 @@ func (m *Model) applyRename(op RenameOp) {
 }
 
 type errMsg struct{ err error }
-
-func buildClaudeCmd(project, sessionID string) *exec.Cmd {
-	claudeBin, _ := exec.LookPath("claude")
-	if claudeBin == "" {
-		claudeBin = "claude"
-	}
-	c := exec.Command(claudeBin, "--resume", sessionID)
-	c.Dir = project
-	return c
-}
 
 func (m Model) View() string {
 	if m.quitting {
@@ -566,8 +573,22 @@ func (m Model) footer() string {
 			StyleHelpDesc.Render("(Esc to dismiss)")
 	}
 	return StyleHelpDesc.Render(
-		" ↑↓ nav  ←→ collapse/expand  Enter resume  n new  /=content  p=preview  ?=help  Esc=quit",
+		fmt.Sprintf(" ↑↓ nav  ←→ fold  Enter resume  n new  /=search  s=sort:%s  p=preview  ?=help  q=quit",
+			sortLabel(m.tree.sort)),
 	)
+}
+
+// sortLabel renders a SortMode for the footer indicator so the active sort is
+// always visible (otherwise msgcount/alpha order reads as "random").
+func sortLabel(s SortMode) string {
+	switch s {
+	case SortMsgCount:
+		return "msgs"
+	case SortAlpha:
+		return "a-z"
+	default:
+		return "recent"
+	}
 }
 
 func isPrintable(k tea.KeyMsg) bool {

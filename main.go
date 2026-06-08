@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/everythingwebza/claude-cpr/internal/data"
@@ -67,9 +68,31 @@ func main() {
 		os.Exit(1)
 	}
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	if _, err := p.Run(); err != nil {
+	final, err := p.Run()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "tui:", err)
 		os.Exit(1)
+	}
+
+	// If the user chose to resume / start a session, the program quit with an
+	// exec request set. p.Run() has already torn down Bubble Tea and restored
+	// the terminal (left alt-screen, disabled mouse, cooked mode), so we can
+	// replace this process with `claude` via execve — claude inherits a clean
+	// terminal and NO cpr parent lingers behind it. This is why resume no
+	// longer leaves a parked cpr process per session.
+	if fm, ok := final.(ui.Model); ok {
+		if req := fm.ExecRequest(); req != nil {
+			if req.Dir != "" {
+				if err := os.Chdir(req.Dir); err != nil {
+					fmt.Fprintf(os.Stderr, "cpr: cannot enter %s: %v\n", req.Dir, err)
+					os.Exit(1)
+				}
+			}
+			if err := syscall.Exec(req.Bin, req.Args, os.Environ()); err != nil {
+				fmt.Fprintf(os.Stderr, "cpr: exec %s: %v\n", req.Bin, err)
+				os.Exit(1)
+			}
+		}
 	}
 }
 

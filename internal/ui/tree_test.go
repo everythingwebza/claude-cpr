@@ -78,6 +78,30 @@ func TestTreeModel_ViewTruncatesLongRowsToWidth(t *testing.T) {
 	}
 }
 
+func TestTreeModel_RowKeepsMsgCountWhenTitleLong(t *testing.T) {
+	// Regression: a long title used to push the meta (age · N msgs) past
+	// m.width, where View's final truncation clipped the count — "397 msgs"
+	// rendered as "· 39". The meta must now always survive; the title is what
+	// gets truncated.
+	long := "this is an extremely long session title that on its own would consume the entire pane width with room to spare"
+	sessions := []data.SessionInfo{
+		{Project: "/p1", SessionID: "s1", Title: long, MsgCount: 397, Modified: "2026-04-29T10:00:00Z"},
+	}
+	tm := NewTreeModel(sessions, map[string]bool{"/p1": true}, nil, SortRecent)
+	tm.SetSize(60, 10)
+
+	out := tm.View()
+	if !strings.Contains(out, "397 msgs") {
+		t.Errorf("rendered tree dropped the message count; want it to contain %q.\nGot:\n%s", "397 msgs", out)
+	}
+	// And the row must still fit the pane width.
+	for i, line := range strings.Split(out, "\n") {
+		if w := visualWidth(line); w > 60 {
+			t.Errorf("line %d width %d > 60: %q", i, w, line)
+		}
+	}
+}
+
 func visualWidth(s string) int {
 	// Strip ANSI escape sequences and count runes. Good enough for the
 	// regression test (no double-width chars in fixture).

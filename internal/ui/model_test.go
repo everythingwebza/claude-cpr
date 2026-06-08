@@ -1,11 +1,90 @@
 package ui
 
 import (
+	"os/exec"
+	"reflect"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/everythingwebza/claude-cpr/internal/data"
 )
+
+// newTestModel builds a Model with no store and an empty statePath (so
+// saveState no-ops) — enough to exercise the resume/new-session state machine.
+func newTestModel() Model {
+	return Model{
+		tree:    NewTreeModel(nil, nil, nil, SortRecent),
+		search:  NewSearchModel(),
+		preview: NewPreviewModel(),
+		keys:    DefaultKeyMap(),
+		focus:   FocusTree,
+	}
+}
+
+// quitsWith reports whether invoking cmd yields a tea.QuitMsg.
+func quitsWith(cmd tea.Cmd) bool {
+	if cmd == nil {
+		return false
+	}
+	_, ok := cmd().(tea.QuitMsg)
+	return ok
+}
+
+func TestExecResume_SetsExecRequestAndQuits(t *testing.T) {
+	bin, err := exec.LookPath("claude")
+	if err != nil {
+		t.Skip("claude not on PATH; skipping exec-request shape test")
+	}
+	m := newTestModel()
+	sess := data.SessionInfo{Project: "/home/u/proj", SessionID: "abc-123"}
+
+	next, cmd := m.execResume(sess, true) // confirmed=true avoids the store/active check
+	nm := next.(Model)
+
+	if !quitsWith(cmd) {
+		t.Errorf("execResume should return a tea.Quit cmd")
+	}
+	if !nm.quitting {
+		t.Errorf("execResume should set quitting=true so the final render blanks")
+	}
+	req := nm.ExecRequest()
+	if req == nil {
+		t.Fatal("ExecRequest() is nil; expected a resume target")
+	}
+	if req.Bin != bin {
+		t.Errorf("Bin = %q, want absolute path %q", req.Bin, bin)
+	}
+	if req.Dir != "/home/u/proj" {
+		t.Errorf("Dir = %q, want /home/u/proj", req.Dir)
+	}
+	wantArgs := []string{bin, "--resume", "abc-123"}
+	if !reflect.DeepEqual(req.Args, wantArgs) {
+		t.Errorf("Args = %v, want %v", req.Args, wantArgs)
+	}
+}
+
+func TestExecNewSession_SetsExecRequestWithoutResume(t *testing.T) {
+	bin, err := exec.LookPath("claude")
+	if err != nil {
+		t.Skip("claude not on PATH; skipping exec-request shape test")
+	}
+	m := newTestModel()
+
+	next, cmd := m.execNewSessionForced("/home/u/proj")
+	nm := next.(Model)
+
+	if !quitsWith(cmd) {
+		t.Errorf("execNewSessionForced should return a tea.Quit cmd")
+	}
+	req := nm.ExecRequest()
+	if req == nil {
+		t.Fatal("ExecRequest() is nil; expected a new-session target")
+	}
+	wantArgs := []string{bin} // no --resume for a fresh session
+	if !reflect.DeepEqual(req.Args, wantArgs) {
+		t.Errorf("Args = %v, want %v", req.Args, wantArgs)
+	}
+}
 
 func TestModelUpdate_ArrowDownMovesTreeCursor(t *testing.T) {
 	sessions := []data.SessionInfo{
